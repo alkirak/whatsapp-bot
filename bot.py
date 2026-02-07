@@ -1,211 +1,155 @@
-import re
-import sqlite3
+import logging
 from datetime import datetime, timedelta
 
 from telegram import Update
 from telegram.ext import (
-    Application,
+    ApplicationBuilder,
+    ContextTypes,
     MessageHandler,
     CommandHandler,
-    ContextTypes,
     filters,
 )
 
-from apscheduler.schedulers.background import BackgroundScheduler
-import pytz
-
-# ================= НАСТРОЙКИ =================
+# ========= НАСТРОЙКИ =========
 
 BOT_TOKEN = "8388581363:AAHzhL7VrXMK4O4y1dAFU-sQXIAzLUvev-o"
 
-TZ = pytz.timezone("Asia/Almaty")
-
-DB_NAME = "reports.db"
-
-BRANCH_CODES = {
-    "t": "Turkistan",
-    "k": "Kentau",
+BRANCHES = {
+    "t": -5174468450,   # Turkistan
+    "k": -5277664922,   # Kentau
 }
 
-# =============================================
+REPORT_DAY = 0   # Понедельник (0 = Monday)
+REPORT_HOUR = 11
+REPORT_MINUTE = 0
+
+# ========= ЛОГИ =========
+
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO,
+)
+
+# ========= ХРАНИЛИЩЕ =========
+# (в будущем можно заменить на БД)
+
+reports = []
 
 
-def init_db():
-    conn = sqlite3.connect(DB_NAME)
-    cur = conn.cursor()
-
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS chats (
-        chat_id INTEGER PRIMARY KEY,
-        branch TEXT
-    )
-    """)
-
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS reports (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        chat_id INTEGER,
-        branch TEXT,
-        date TEXT,
-        shift TEXT,
-        total INTEGER,
-        created_at TEXT
-    )
-    """)
-
-    conn.commit()
-    conn.close()
-
-
-# ---------- HELPERS ----------
-
-def get_branch(chat_id):
-    conn = sqlite3.connect(DB_NAME)
-    cur = conn.cursor()
-    cur.execute("SELECT branch FROM chats WHERE chat_id = ?", (chat_id,))
-    row = cur.fetchone()
-    conn.close()
-    return row[0] if row else None
-
-
-def save_branch(chat_id, branch):
-    conn = sqlite3.connect(DB_NAME)
-    cur = conn.cursor()
-    cur.execute(
-        "INSERT OR REPLACE INTO chats (chat_id, branch) VALUES (?, ?)",
-        (chat_id, branch),
-    )
-    conn.commit()
-    conn.close()
-
-
-def save_report(chat_id, branch, date, shift, total):
-    conn = sqlite3.connect(DB_NAME)
-    cur = conn.cursor()
-    cur.execute("""
-        INSERT INTO reports (chat_id, branch, date, shift, total, created_at)
-        VALUES (?, ?, ?, ?, ?, ?)
-    """, (
-        chat_id,
-        branch,
-        date,
-        shift,
-        total,
-        datetime.now().isoformat()
-    ))
-    conn.commit()
-    conn.close()
-
-
-# ---------- COMMANDS ----------
-
-async def bind(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await update.message.reply_text("❌ Используй: /bind t или /bind k")
-        return
-
-    code = context.args[0].lower()
-    if code not in BRANCH_CODES:
-        await update.message.reply_text("❌ Неизвестный филиал. Доступно: t, k")
-        return
-
-    save_branch(update.effective_chat.id, BRANCH_CODES[code])
-    await update.message.reply_text(
-        f"✅ Филиал привязан: {BRANCH_CODES[code]} ({code})"
-    )
-
-
-# ---------- REPORT PARSER ----------
+# ========= ПАРСИНГ ОТЧЁТА =========
 
 def parse_report(text: str):
-    date_match = re.search(r"(\d{2}\.\d{2}\.\d{4})", text)
-    shift_match = re.search(r"(Ночь|День)", text, re.IGNORECASE)
-    total_match = re.search(r"Общая касса[:\s]*([\d\s]+)", text)
+    data = {
+        "date": None,
+        "shift": None,
+        "total": None,
+        "branch": None,
+    }
 
-    if not date_match or not shift_match or not total_match:
-        return None
+    lines = text.lower().splitlines()
 
-    date = date_match.group(1)
-    shift = shift_match.group(1).capitalize()
-    total = int(total_match.group(1).replace(" ", ""))
+    for line in lines:
+        if "день" in line:
+            data["shift"] = "День"
+        if "ночь" in line:
+            data["shift"] = "Ночь"
 
-    return date, shift, total
+        if "общая касса" in line:
+            digits = "".join(c for c in line if c.isdigit())
+            if digits:
+                data["total"] = int(digits)
+
+        for key in BRANCHES:
+            if key in line:
+                data["branch"] = key
+
+        for part in line.split():
+            if "." in part and len(part) == 10:
+                data["date"] = part
+
+    return data
 
 
-async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message or not update.message.text:
+# ========= ОБРАБОТКА СООБЩЕНИЙ =========
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text
+    chat_id = update.message.chat_id
+
+    report = parse_report(text)
+
+    if not report["date"] or not report["shift"] or not report["total"]:
         return
 
-    chat_id = update.effective_chat.id
-    branch = get_branch(chat_id)
-
-    if not branch:
-        return  # филиал не привязан — молчим
-
-    parsed = parse_report(update.message.text)
-    if not parsed:
-        return
-
-    date, shift, total = parsed
-
-    save_report(chat_id, branch, date, shift, total)
+    report["chat_id"] = chat_id
+    reports.append(report)
 
     await update.message.reply_text(
         f"✅ Отчёт принят\n"
-        f"🏢 {branch}\n"
-        f"📅 {date}\n"
-        f"🕒 {shift}\n"
-        f"💰 Оборот: {total:,}".replace(",", " ")
+        f"📅 {report['date']}\n"
+        f"🕒 {report['shift']}\n"
+        f"💰 {report['total']}"
     )
 
 
-# ---------- WEEKLY REPORT ----------
+# ========= КОМАНДЫ =========
 
-def send_weekly_reports(app: Application):
-    conn = sqlite3.connect(DB_NAME)
-    cur = conn.cursor()
+async def whoami(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        f"Chat ID: {update.message.chat_id}"
+    )
 
-    week_ago = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d")
 
-    cur.execute("""
-        SELECT chat_id, branch, SUM(total)
-        FROM reports
-        WHERE created_at >= ?
-        GROUP BY chat_id, branch
-    """, (week_ago,))
+async def weekly_report(context: ContextTypes.DEFAULT_TYPE):
+    now = datetime.now()
+    start = now - timedelta(days=7)
 
-    rows = cur.fetchall()
-    conn.close()
+    summary = {}
 
-    for chat_id, branch, total in rows:
-        text = (
-            f"📊 Недельный отчёт\n"
-            f"🏢 {branch}\n"
-            f"💰 Итого за неделю: {int(total):,}".replace(",", " ")
+    for r in reports:
+        try:
+            d = datetime.strptime(r["date"], "%d.%m.%Y")
+        except:
+            continue
+
+        if d >= start:
+            b = r["branch"] or "unknown"
+            summary[b] = summary.get(b, 0) + (r["total"] or 0)
+
+    text = "📊 *Недельный отчёт*\n\n"
+
+    if not summary:
+        text += "Нет данных"
+    else:
+        for b, total in summary.items():
+            name = "Turkistan" if b == "t" else "Kentau"
+            text += f"🏢 {name}: {total}\n"
+
+    for chat_id in BRANCHES.values():
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=text,
+            parse_mode="Markdown"
         )
-        app.bot.send_message(chat_id=chat_id, text=text)
 
 
-# ---------- MAIN ----------
+# ========= ЗАПУСК =========
 
 def main():
-    init_db()
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
 
-    app = Application.builder().token(BOT_TOKEN).build()
+    app.add_handler(CommandHandler("whoami", whoami))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    app.add_handler(CommandHandler("bind", bind))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
-
-    scheduler = BackgroundScheduler(timezone=TZ)
-    scheduler.add_job(
-        send_weekly_reports,
-        "cron",
-        day_of_week="mon",
-        hour=11,
-        minute=0,
-        args=[app],
+    app.job_queue.run_daily(
+        weekly_report,
+        time=datetime.now().replace(
+            hour=REPORT_HOUR,
+            minute=REPORT_MINUTE,
+            second=0,
+        ).time(),
+        days=(REPORT_DAY,)
     )
-    scheduler.start()
 
     print("🤖 Bot started")
     app.run_polling()
