@@ -1,17 +1,28 @@
 from flask import Flask, request
 from twilio.twiml.messaging_response import MessagingResponse
 import os, json, re
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 app = Flask(__name__)
 REPORTS_FILE = "reports.json"
+
+# === НАСТРОЙКИ ===
+REQUIRE_KNOWN_ADMIN = True  # True = отчёты принимаем только от номеров в ADMIN_BRANCH
+TZ_OFFSET_HOURS = 5         # Казахстан часто UTC+5. Если у тебя другой пояс — поменяем.
 
 # Номера админов -> филиалы (Twilio формат: whatsapp:+7XXXXXXXXXX)
 ADMIN_BRANCH = {
     "whatsapp:+77070610093": "Polygon Turkistan",
     "whatsapp:+77081474845": "Polygon Kentau",
-    "whatsapp:+77089273230": "Polygon Turkistan",
+    "whatsapp:+77089273230": "Polygon Turkistan",  # твой номер (для тестов)
 }
+
+# === ХЕЛПЕРЫ ===
+def now_local():
+    return datetime.now(timezone.utc) + timedelta(hours=TZ_OFFSET_HOURS)
+
+def today_str():
+    return now_local().strftime("%d.%m.%Y")
 
 def load_reports():
     if not os.path.exists(REPORTS_FILE):
@@ -27,14 +38,9 @@ def save_reports(reports):
         json.dump(reports, f, ensure_ascii=False, indent=2)
 
 def norm_num(s: str) -> int:
-    # "63 970" -> 63970
     return int(re.sub(r"[^\d]", "", s))
 
 def extract_money_after(labels, text: str):
-    """
-    labels: list[str] possible label spellings
-    Finds "label: 12345"
-    """
     for label in labels:
         m = re.search(rf"{label}\s*:\s*([0-9\s]+)", text, re.IGNORECASE)
         if m:
@@ -42,11 +48,6 @@ def extract_money_after(labels, text: str):
     return None
 
 def extract_shift_header(block: str):
-    """
-    Examples:
-    "06.02.2026г. Ночь смена Уля"
-    "06.02.2026 День смена Ару"
-    """
     dm = re.search(r"(\d{2}\.\d{2}\.\d{4})", block)
     date = dm.group(1) if dm else None
 
@@ -62,13 +63,9 @@ def extract_shift_header(block: str):
     return date, shift, employee
 
 def split_into_reports(text: str):
-    """
-    Splits message into multiple report blocks by finding repeated headers.
-    """
     t = text.replace("\r\n", "\n").replace("\r", "\n").strip()
-
     header_re = re.compile(
-        r"(?=(\d{2}\.\d{2}\.\d{4}).{0,40}\b(ночь|ночная|день|дневная)\b)",
+        r"(?=(\d{2}\.\d{2}\.\d{4}).{0,60}\b(ночь|ночная|день|дневная)\b)",
         re.IGNORECASE | re.DOTALL
     )
     positions = [m.start() for m in header_re.finditer(t)]
@@ -87,12 +84,11 @@ def parse_one_report(block: str):
     date, shift, employee = extract_shift_header(block)
 
     total = extract_money_after(["Общая касса", "Касса общая", "Общая"], block)
-    cash = extract_money_after(["Нал", "Наличка", "Наличные"], block)  # первое "Нал" = общая касса нал
-    kaspi = extract_money_after(["Каспи", "Kaspi", "KASPI"], block)     # первое "Каспи" = общая касса каспи
+    cash = extract_money_after(["Нал", "Наличка", "Наличные"], block)
+    kaspi = extract_money_after(["Каспи", "Kaspi", "KASPI"], block)
 
     drinks_total = extract_money_after(["Напитки", "Бар", "Напиток"], block)
 
-    # Drinks cash/kaspi only within drinks section
     drinks_cash = None
     drinks_kaspi = None
     msec = re.search(
@@ -106,7 +102,6 @@ def parse_one_report(block: str):
         drinks_cash = norm_num(m1.group(2)) if m1 else None
         drinks_kaspi = norm_num(m2.group(2)) if m2 else None
 
-    # Withdrawals
     withdrawals = []
     w = re.search(r"Изъятие\s*:\s*(.+?)(Остаток|$)", block, re.IGNORECASE | re.DOTALL)
     if w:
@@ -117,7 +112,6 @@ def parse_one_report(block: str):
             parts = re.split(r"\s+(?=[A-Za-zА-Яа-яЁё]+-)", raw)
         withdrawals = [p.strip() for p in parts if p.strip()]
 
-    # Remainder
     remainder = None
     r = re.search(r"Остаток\s*:\s*(.+)$", block, re.IGNORECASE | re.DOTALL)
     if r:
@@ -142,29 +136,217 @@ def parse_one_report(block: str):
     }
     return data, None
 
+def fmt_money(n):
+    if n is None:
+        return "—"
+    return f"{int(n):,}".replace(",", " ")
+
+def validate_report(r):
+    warnings = []
+    if r.get("total") is not None and r.get("cash") is not None and r.get("kaspi") is not None:
+        if r["total"] != (r["cash"] + r["kaspi"]):
+            warnings.append(f"⚠️ Общая касса не сходится: {r['total']} ≠ {r['cash']}+{r['kaspi']}")
+    if r.get("drinks_total") is not None and r.get("drinks_cash") is not None and r.get("drinks_kaspi") is not None:
+        if r["drinks_total"] != (r["drinks_cash"] + r["drinks_kaspi"]):
+            warnings.append(f"⚠️ Напитки не сходятся: {r['drinks_total']} ≠ {r['drinks_cash']}+{r['drinks_kaspi']}")
+    return warnings
+
+def summarize_for_date(reports, date_str):
+    rows = [r for r in reports if r.get("date") == date_str and r.get("total") is not None]
+    if not rows:
+        return f"📊 {date_str}: отчётов нет."
+
+    by = {}
+    for r in rows:
+        br = r.get("branch") or "(филиал не задан)"
+        sh = r.get("shift") or "?"
+        by.setdefault(br, {})
+        by[br][sh] = r  # последний по смене
+
+    lines = [f"📊 Сводка за {date_str}"]
+    grand_total = 0
+
+    for br in sorted(by.keys()):
+        night = by[br].get("Ночь")
+        day = by[br].get("День")
+        br_sum = 0
+
+        lines.append(f"\n🏢 {br}")
+        if night:
+            br_sum += night.get("total", 0) or 0
+            lines.append(f"  🌙 Ночь: {fmt_money(night.get('total'))}")
+        else:
+            lines.append("  🌙 Ночь: —")
+
+        if day:
+            br_sum += day.get("total", 0) or 0
+            lines.append(f"  ☀️ День: {fmt_money(day.get('total'))}")
+        else:
+            lines.append("  ☀️ День: —")
+
+        lines.append(f"  ✅ Итого филиал: {fmt_money(br_sum)}")
+        grand_total += br_sum
+
+    lines.append(f"\n💰 Общий итог: {fmt_money(grand_total)}")
+    return "\n".join(lines)
+
+def summarize_month(reports, mm_yyyy: str):
+    # mm_yyyy = "02.2026"
+    rows = [r for r in reports if r.get("date", "").endswith(mm_yyyy) and r.get("total") is not None]
+    if not rows:
+        return f"📅 Месяц {mm_yyyy}: отчётов нет."
+
+    by = {}  # branch -> shift -> sum
+    for r in rows:
+        br = r.get("branch") or "(филиал не задан)"
+        sh = r.get("shift") or "?"
+        by.setdefault(br, {"Ночь": 0, "День": 0, "?": 0})
+        by[br][sh] = by[br].get(sh, 0) + (r.get("total") or 0)
+
+    lines = [f"📅 Месячный отчёт: {mm_yyyy}"]
+    grand_total = 0
+    for br in sorted(by.keys()):
+        night = by[br].get("Ночь", 0)
+        day = by[br].get("День", 0)
+        br_sum = night + day + by[br].get("?", 0)
+
+        lines.append(f"\n🏢 {br}")
+        lines.append(f"  🌙 Ночь: {fmt_money(night)}")
+        lines.append(f"  ☀️ День: {fmt_money(day)}")
+        if by[br].get("?", 0):
+            lines.append(f"  ❓ Неизв.: {fmt_money(by[br].get('?', 0))}")
+        lines.append(f"  ✅ Итого: {fmt_money(br_sum)}")
+        grand_total += br_sum
+
+    lines.append(f"\n💰 Общий итог: {fmt_money(grand_total)}")
+    return "\n".join(lines)
+
+def summarize_range(reports, d1, d2):
+    # inclusive range
+    def parse_d(s):
+        return datetime.strptime(s, "%d.%m.%Y").date()
+    try:
+        a = parse_d(d1)
+        b = parse_d(d2)
+    except Exception:
+        return "❌ Формат диапазона: range 01.02.2026 07.02.2026"
+
+    if b < a:
+        a, b = b, a
+
+    rows = []
+    for r in reports:
+        ds = r.get("date")
+        if not ds:
+            continue
+        try:
+            rd = parse_d(ds)
+        except Exception:
+            continue
+        if a <= rd <= b and r.get("total") is not None:
+            rows.append(r)
+
+    if not rows:
+        return f"📆 Диапазон {d1}–{d2}: отчётов нет."
+
+    # Sum totals by branch
+    by = {}
+    for r in rows:
+        br = r.get("branch") or "(филиал не задан)"
+        by.setdefault(br, 0)
+        by[br] += (r.get("total") or 0)
+
+    lines = [f"📆 Отчёт за период {d1}–{d2} (общая касса)"]
+    grand = 0
+    for br in sorted(by.keys()):
+        lines.append(f"🏢 {br}: {fmt_money(by[br])}")
+        grand += by[br]
+    lines.append(f"\n💰 Общий итог: {fmt_money(grand)}")
+    return "\n".join(lines)
+
+def list_branches_today(reports):
+    d = today_str()
+    rows = [r for r in reports if r.get("date") == d]
+    counts = {}
+    for r in rows:
+        br = r.get("branch") or "(филиал не задан)"
+        counts[br] = counts.get(br, 0) + 1
+    lines = [f"🏢 Филиалы сегодня ({d}):"]
+    if not counts:
+        lines.append("— отчётов нет")
+        return "\n".join(lines)
+    for br in sorted(counts.keys()):
+        lines.append(f"- {br}: {counts[br]} отч.")
+    return "\n".join(lines)
+
+# === ROUTES ===
 @app.route("/whatsapp", methods=["POST"])
 def whatsapp():
     incoming = (request.values.get("Body", "") or "").strip()
-    sender = request.values.get("From", "")  # e.g. 'whatsapp:+7707...'
+    sender = request.values.get("From", "")
     branch = ADMIN_BRANCH.get(sender)
-
     resp = MessagingResponse()
 
-    # Команда, чтобы увидеть как Twilio видит номер
-    if incoming.lower().strip() == "whoami":
+    low = incoming.lower().strip()
+
+    # whoami
+    if low == "whoami":
         resp.message(f"From: {sender}\nФилиал: {branch or '(не задан)'}")
         return str(resp)
 
-    if incoming.lower().strip() in ("help", "помощь"):
+    # help
+    if low in ("help", "помощь"):
         resp.message(
-            "Отправляйте отчёт как обычно, можно даже два отчёта одним сообщением.\n\n"
-            "Пример:\n"
-            "06.02.2026г. Ночь смена Уля\n"
-            "Общая касса: 83450\nНал: 14030\nКаспи: 63970\n\n"
-            "Напитки: 5450\nНал: 1600\nКаспи: 3850\n\n"
-            "Изъятие: Уля-ЗП-7000\nАлишер-60000(нал.)\n"
-            "Остаток: 5500+6480(мел.)"
+            "Команды:\n"
+            "today / сегодня — сводка за сегодня по всем филиалам\n"
+            "day 06.02.2026 — сводка за дату\n"
+            "month / месяц — отчёт за текущий месяц\n"
+            "month 02.2026 — отчёт за месяц\n"
+            "range 01.02.2026 07.02.2026 — отчёт за период\n"
+            "branch — список филиалов и отчётов за сегодня\n"
+            "whoami — показать твой номер как видит Twilio\n\n"
+            "Отчёт отправляйте как обычно (можно 2 смены одним сообщением)."
         )
+        return str(resp)
+
+    reports = load_reports()
+
+    # today
+    if low in ("today", "сегодня"):
+        resp.message(summarize_for_date(reports, today_str()))
+        return str(resp)
+
+    # day DD.MM.YYYY
+    m = re.match(r"^day\s+(\d{2}\.\d{2}\.\d{4})$", low)
+    if m:
+        resp.message(summarize_for_date(reports, m.group(1)))
+        return str(resp)
+
+    # month / месяц or month MM.YYYY
+    if low in ("month", "месяц"):
+        mm_yyyy = now_local().strftime("%m.%Y")
+        resp.message(summarize_month(reports, mm_yyyy))
+        return str(resp)
+
+    m = re.match(r"^month\s+(\d{2}\.\d{4})$", low)
+    if m:
+        resp.message(summarize_month(reports, m.group(1)))
+        return str(resp)
+
+    # range DD.MM.YYYY DD.MM.YYYY
+    m = re.match(r"^range\s+(\d{2}\.\d{2}\.\d{4})\s+(\d{2}\.\d{2}\.\d{4})$", low)
+    if m:
+        resp.message(summarize_range(reports, m.group(1), m.group(2)))
+        return str(resp)
+
+    # branch
+    if low == "branch":
+        resp.message(list_branches_today(reports))
+        return str(resp)
+
+    # === Report intake ===
+    if REQUIRE_KNOWN_ADMIN and not branch:
+        resp.message("⛔ У вас нет доступа к отправке отчётов. (номер не зарегистрирован)")
         return str(resp)
 
     blocks = split_into_reports(incoming)
@@ -172,28 +354,34 @@ def whatsapp():
     for b in blocks:
         data, err = parse_one_report(b)
         if err:
-            resp.message("❌ " + err + "\n\nНапиши: help — покажу пример.")
+            resp.message("❌ " + err + "\n\nНапиши: help — список команд и пример.")
             return str(resp)
-        data["branch"] = branch
+        data["branch"] = branch or "(филиал не задан)"
         parsed.append(data)
 
-    reports = load_reports()
     ts = datetime.now(timezone.utc).isoformat()
     for d in parsed:
         d["ts_utc"] = ts
         d["from"] = sender
         reports.append(d)
+
     save_reports(reports)
 
+    # Reply summary + warnings
     lines = [f"✅ Принял отчёты: {len(parsed)} шт."]
+    warnings_all = []
     for i, d in enumerate(parsed, 1):
         lines.append(
-            f"{i}) {d.get('branch','(филиал не задан)')} | {d['date']} — {d['shift']}"
+            f"{i}) {d.get('branch')} | {d['date']} — {d['shift']}"
             + (f" ({d['employee']})" if d.get("employee") else "")
-            + (f": общая {d['total']}" if d.get("total") is not None else "")
-            + (f", нал {d['cash']}" if d.get("cash") is not None else "")
-            + (f", каспи {d['kaspi']}" if d.get("kaspi") is not None else "")
+            + (f": общая {fmt_money(d.get('total'))}" if d.get("total") is not None else "")
+            + (f", нал {fmt_money(d.get('cash'))}" if d.get("cash") is not None else "")
+            + (f", каспи {fmt_money(d.get('kaspi'))}" if d.get("kaspi") is not None else "")
         )
+        warnings_all.extend(validate_report(d))
+
+    if warnings_all:
+        lines.append("\n" + "\n".join(warnings_all))
 
     resp.message("\n".join(lines))
     return str(resp)
@@ -204,8 +392,8 @@ def health():
 
 @app.route("/reports", methods=["GET"])
 def get_reports():
+    # позже закроем паролем/токеном
     return {"reports": load_reports()}
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
-
