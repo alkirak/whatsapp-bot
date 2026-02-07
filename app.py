@@ -10,6 +10,7 @@ REPORTS_FILE = "reports.json"
 ADMIN_BRANCH = {
     "whatsapp:+77070610093": "Polygon Turkistan",
     "whatsapp:+77081474845": "Polygon Kentau",
+    "whatsapp:+77089273230": "Polygon Turkistan",
 }
 
 def load_reports():
