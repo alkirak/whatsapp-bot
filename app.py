@@ -149,15 +149,44 @@ def validate_report(r):
     kaspi = r.get("kaspi")
     drinks_total = r.get("drinks_total")
 
-    # 1) Проверка общей кассы с учётом напитков (как у вас)
+    # --- вытаскиваем суммы "возврат" из текста изъятий (если есть) ---
+    # Примеры: "Возврат-1500(каспи)" / "возврат 1500" / "Возврат: 1500"
+    refund_sum = 0
+    raw_withdrawals = " ".join(r.get("withdrawals", []) or [])
+    for m in re.finditer(r"(возврат)\s*[-: ]\s*([0-9\s]+)", raw_withdrawals, re.IGNORECASE):
+        refund_sum += norm_num(m.group(2))
+
+    # 1) Проверка общей кассы
     if total is not None and cash is not None and kaspi is not None and drinks_total is not None:
-        if total != (cash + kaspi + drinks_total):
-            warnings.append(
-                f"⚠️ Общая касса не сходится: {total} ≠ {cash}+{kaspi}+{drinks_total} (нал+каспи+напитки)"
-            )
+        base = cash + kaspi + drinks_total
+
+        if total == base:
+            pass  # всё ок
+        else:
+            # если есть возвраты — попробуем объяснить расхождение
+            if refund_sum > 0:
+                if total == base + refund_sum:
+                    warnings.append(
+                        f"ℹ️ Общая касса сходится, если 'возврат' учитывать как +{refund_sum}: {total} = {cash}+{kaspi}+{drinks_total}+{refund_sum}"
+                    )
+                elif total == base - refund_sum:
+                    warnings.append(
+                        f"ℹ️ Общая касса сходится, если 'возврат' учитывать как -{refund_sum}: {total} = {cash}+{kaspi}+{drinks_total}-{refund_sum}"
+                    )
+                else:
+                    warnings.append(
+                        f"⚠️ Общая касса не сходится: {total} ≠ {cash}+{kaspi}+{drinks_total} (нал+каспи+напитки). "
+                        f"Возврат найден: {refund_sum}"
+                    )
+            else:
+                warnings.append(
+                    f"⚠️ Общая касса не сходится: {total} ≠ {cash}+{kaspi}+{drinks_total} (нал+каспи+напитки)"
+                )
+
     elif total is not None and cash is not None and kaspi is not None:
         # fallback если напитки не указаны
-        if total != (cash + kaspi):
+        base = cash + kaspi
+        if total != base:
             warnings.append(f"⚠️ Общая касса не сходится: {total} ≠ {cash}+{kaspi}")
 
     # 2) Проверка напитков по разбиению нал/каспи в секции напитков
@@ -168,6 +197,7 @@ def validate_report(r):
             warnings.append(f"⚠️ Напитки не сходятся: {drinks_total} ≠ {dc}+{dk}")
 
     return warnings
+
 
 
 def summarize_for_date(reports, date_str):
