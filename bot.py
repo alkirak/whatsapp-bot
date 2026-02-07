@@ -1,6 +1,8 @@
+# bot.py
 import os
 import re
 import sqlite3
+import hashlib
 from dataclasses import dataclass
 from datetime import datetime, date, timedelta, time as dtime
 from zoneinfo import ZoneInfo
@@ -21,18 +23,20 @@ from telegram.ext import (
 # CONFIG
 # =========================
 
-TZ = ZoneInfo(os.getenv("TZ", "Asia/Almaty"))  # GMT+5
+TZ = ZoneInfo(os.getenv("TZ", "Asia/Almaty"))
 DB_PATH = os.getenv("DB_PATH", "data.db")
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is empty. Set env var BOT_TOKEN in Railway.")
 
-# Привязка чатов -> филиал
-CHAT_T = int(os.getenv("CHAT_T", "-5174468450"))  # Turkistan group chat_id
-CHAT_K = int(os.getenv("CHAT_K", "-5277664922"))  # Kentau group chat_id
+# Привязка чатов к филиалам:
+# t = Turkistan, k = Kentau
+CHAT_T = int(os.getenv("CHAT_T", "-5174468450"))
+CHAT_K = int(os.getenv("CHAT_K", "-5277664922"))
 
 ENABLE_WEEKLY_DIGEST = os.getenv("ENABLE_WEEKLY_DIGEST", "1") == "1"
+WEEKLY_DIGEST_TIME = os.getenv("WEEKLY_DIGEST_TIME", "11:00")  # понедельник 11:00
 
 # =========================
 # DB
@@ -47,7 +51,6 @@ def db() -> sqlite3.Connection:
 def init_db() -> None:
     conn = db()
     cur = conn.cursor()
-
     cur.execute("""
     CREATE TABLE IF NOT EXISTS reports (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -57,36 +60,29 @@ def init_db() -> None:
         shift TEXT NOT NULL,               -- 'day' or 'night'
         staff TEXT,
 
-        cashbox_total INTEGER,             -- "Общая касса" (услуги+напитки)
-
-        services_total INTEGER,            -- услуги (нал+каспи)
+        cashbox_total INTEGER,             -- "Общая касса" (если есть)
+        services_total INTEGER,            -- "Услуги" (или вычислено)
         services_cash INTEGER,
         services_kaspi INTEGER,
 
-        drinks_total INTEGER,
+        drinks_total INTEGER,              -- "Напитки"
         drinks_cash INTEGER,
         drinks_kaspi INTEGER,
 
-        withdraw_total INTEGER DEFAULT 0,
-        purchase_total INTEGER DEFAULT 0,
-        refund_total INTEGER DEFAULT 0,
+        withdraw_total INTEGER DEFAULT 0,  -- Изъятие (сумма чисел)
+        purchase_total INTEGER DEFAULT 0,  -- Закуп
+        refund_total INTEGER DEFAULT 0,    -- Возврат
 
         raw TEXT NOT NULL,
         fingerprint TEXT NOT NULL,
         created_at TEXT NOT NULL
     );
     """)
-
-    # миграция для старых баз (если таблица была создана без cashbox_total)
-    try:
-        cur.execute("ALTER TABLE reports ADD COLUMN cashbox_total INTEGER;")
-    except sqlite3.OperationalError:
-        pass
-
     cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_reports_fingerprint ON reports(fingerprint);")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_reports_branch_date ON reports(branch, report_date);")
     conn.commit()
     conn.close()
+
 
 # =========================
 # PARSING
@@ -98,9 +94,9 @@ class ParsedReport:
     shift: str                 # 'day' | 'night'
     staff: Optional[str]
 
-    cashbox_total: Optional[int]      # "Общая касса" (услуги + напитки)
+    cashbox_total: Optional[int]
 
-    services_total: Optional[int]     # услуги (нал+каспи)
+    services_total: Optional[int]
     services_cash: Optional[int]
     services_kaspi: Optional[int]
 
@@ -111,6 +107,7 @@ class ParsedReport:
     withdraw_total: int
     purchase_total: int
     refund_total: int
+
     raw_block: str
 
 
@@ -156,7 +153,7 @@ def detect_date(text: str) -> Optional[date]:
 def split_into_blocks(text: str) -> List[str]:
     """
     В одном сообщении может быть 1-2+ отчёта.
-    Делим по датам (каждая дата — начало нового отчёта).
+    Делим по вхождениям даты (каждая дата обычно начало отчёта).
     """
     text = text.replace("\r\n", "\n")
     positions = [m.start() for m in DATE_RE.finditer(text)]
@@ -174,7 +171,7 @@ def split_into_blocks(text: str) -> List[str]:
 
 
 def extract_staff(block: str) -> Optional[str]:
-    # "06.02.2026г. Ночь смена Уля" -> Уля
+    # Пример: "06.02.2026г. Ночь смена Уля" или "День смена Ару"
     for line in block.split("\n"):
         if "смен" in line.lower():
             m = re.search(r"смена\s+([A-Za-zА-Яа-яЁё\-]+)", line, re.IGNORECASE)
@@ -183,38 +180,74 @@ def extract_staff(block: str) -> Optional[str]:
     return None
 
 
-def extract_money_section(block: str, title_words: Tuple[str, ...]) -> Tuple[Optional[int], Optional[int], Optional[int]]:
+def extract_section_with_stop(
+    block: str,
+    title_predicate,
+    stop_markers: Tuple[str, ...],
+) -> Tuple[Optional[int], Optional[int], Optional[int]]:
     """
-    Секции:
-      Общая касса: 83450
-      Нал: 14030
-      Каспи: 63970
-    или
-      Напитки: 5450
-      Нал: 1600
-      Каспи: 3850
+    Универсально для секций вида:
+      <title>: <total>
+      Нал: <cash>
+      Каспи: <kaspi>
+    Важно: как только встретили другой раздел (stop_markers) — прекращаем.
     """
     lines = [ln.strip() for ln in block.split("\n") if ln.strip()]
     total = cash = kaspi = None
+
     for i, ln in enumerate(lines):
         low = ln.lower()
-        if any(w in low for w in title_words):
+        if title_predicate(low):
             m = re.search(r":\s*([0-9 ][0-9 ]*)", ln)
             if m:
                 total = norm_int(m.group(1))
 
-            for j in range(i + 1, min(i + 7, len(lines))):
+            for j in range(i + 1, min(i + 12, len(lines))):
                 l2 = lines[j].lower()
+
+                # стоп, если начался другой раздел
+                if any(sm in l2 for sm in stop_markers):
+                    break
+
                 if "нал" in l2:
                     m2 = re.search(r":\s*([0-9 ][0-9 ]*)", lines[j])
                     if m2:
                         cash = norm_int(m2.group(1))
+
                 if "касп" in l2 or "kaspi" in l2:
                     m2 = re.search(r":\s*([0-9 ][0-9 ]*)", lines[j])
                     if m2:
                         kaspi = norm_int(m2.group(1))
             break
+
     return total, cash, kaspi
+
+
+def extract_cashbox(block: str) -> Tuple[Optional[int], Optional[int], Optional[int]]:
+    stop = ("услуг", "напит", "изъят", "остаток", "возврат", "закуп", "преми")
+    return extract_section_with_stop(
+        block,
+        lambda low: ("общая касса" in low) or (low.startswith("общая")) or ("оборот" in low),
+        stop
+    )
+
+
+def extract_services(block: str) -> Tuple[Optional[int], Optional[int], Optional[int]]:
+    stop = ("напит", "изъят", "остаток", "возврат", "закуп", "преми", "общая касса", "оборот")
+    return extract_section_with_stop(
+        block,
+        lambda low: "услуг" in low,
+        stop
+    )
+
+
+def extract_drinks(block: str) -> Tuple[Optional[int], Optional[int], Optional[int]]:
+    stop = ("услуг", "изъят", "остаток", "возврат", "закуп", "преми", "общая касса", "оборот")
+    return extract_section_with_stop(
+        block,
+        lambda low: "напит" in low,
+        stop
+    )
 
 
 def sum_inline_amounts(line: str) -> int:
@@ -229,51 +262,17 @@ def sum_inline_amounts(line: str) -> int:
 
 def extract_ops(block: str) -> Tuple[int, int, int]:
     """
-    Изъятие / Закуп / Возврат
-    Умеет съедать продолжение строк после заголовка:
-    Изъятие: Уля-ЗП-7000
-    Алишер-60000(нал.)
+    Изъятие, Закуп, Возврат - суммы чисел в строках.
     """
     withdraw = purchase = refund = 0
-
-    stop_words = ("остаток", "напит", "общ", "оборот", "касса", "нал:", "касп", "kaspi", "возврат", "закуп", "изъят")
-    mode = None  # 'withdraw' | 'purchase' | 'refund' | None
-
-    lines = block.split("\n")
-    for ln in lines:
-        low = ln.lower().strip()
-        if not low:
-            mode = None
-            continue
-
+    for ln in block.split("\n"):
+        low = ln.lower()
         if "изъят" in low:
-            mode = "withdraw"
             withdraw += sum_inline_amounts(ln)
-            continue
         if "закуп" in low:
-            mode = "purchase"
             purchase += sum_inline_amounts(ln)
-            continue
         if "возврат" in low:
-            mode = "refund"
             refund += sum_inline_amounts(ln)
-            continue
-
-        # continuation lines for mode (если строка не начинается с другого раздела)
-        if mode:
-            # если строка явно новая секция — выходим
-            if any(w in low for w in ("остаток", "напит", "общ", "оборот", "касса")) or DATE_RE.search(ln):
-                mode = None
-                continue
-            val = sum_inline_amounts(ln)
-            if val > 0:
-                if mode == "withdraw":
-                    withdraw += val
-                elif mode == "purchase":
-                    purchase += val
-                elif mode == "refund":
-                    refund += val
-
     return withdraw, purchase, refund
 
 
@@ -285,16 +284,17 @@ def parse_report_block(block: str) -> Optional[ParsedReport]:
 
     staff = extract_staff(block)
 
-    # "Общая касса" — это общая (услуги + напитки)
-    cashbox_total, services_cash, services_kaspi = extract_money_section(
-        block, ("общая касса", "общая", "оборот")
-    )
+    cashbox_total, cashbox_cash, cashbox_kaspi = extract_cashbox(block)
+    services_total, services_cash, services_kaspi = extract_services(block)
+    drinks_total, drinks_cash, drinks_kaspi = extract_drinks(block)
 
-    services_total = None
-    if services_cash is not None and services_kaspi is not None:
-        services_total = services_cash + services_kaspi
-
-    drinks_total, drinks_cash, drinks_kaspi = extract_money_section(block, ("напитки",))
+    # Если "Услуги:" не написали — считаем услуги как нал+каспи из "Общая касса"
+    # (это "услуги", напитки отдельно)
+    if services_total is None and services_cash is None and services_kaspi is None:
+        services_cash = cashbox_cash
+        services_kaspi = cashbox_kaspi
+        if services_cash is not None and services_kaspi is not None:
+            services_total = services_cash + services_kaspi
 
     withdraw_total, purchase_total, refund_total = extract_ops(block)
 
@@ -316,9 +316,14 @@ def parse_report_block(block: str) -> Optional[ParsedReport]:
         withdraw_total=withdraw_total,
         purchase_total=purchase_total,
         refund_total=refund_total,
+
         raw_block=block.strip(),
     )
 
+
+# =========================
+# BRANCH helpers
+# =========================
 
 def branch_from_chat(chat_id: int) -> Optional[str]:
     if chat_id == CHAT_T:
@@ -336,44 +341,60 @@ def shift_name(shift: str) -> str:
     return "День" if shift == "day" else "Ночь"
 
 
-def make_fingerprint(branch: str, pr: ParsedReport) -> str:
-    raw_norm = re.sub(r"\s+", " ", pr.raw_block.strip())
-    parts = [
-        branch,
-        pr.report_date.isoformat(),
-        pr.shift,
-        str(pr.cashbox_total or ""),
-        str(pr.services_cash or ""),
-        str(pr.services_kaspi or ""),
-        str(pr.drinks_total or ""),
-        str(pr.drinks_cash or ""),
-        str(pr.drinks_kaspi or ""),
-        raw_norm[:200],
-    ]
-    return "|".join(parts)
-
-# =========================
-# VALIDATION / MESSAGES
-# =========================
-
 def fmt_money(n: Optional[int]) -> str:
     if n is None:
         return "—"
     return f"{n:,}".replace(",", " ")
 
 
+# =========================
+# DEDUPE fingerprint
+# =========================
+
+def make_fingerprint(branch: str, pr: ParsedReport) -> str:
+    raw_norm = re.sub(r"\s+", " ", pr.raw_block.strip())
+    base = "|".join([
+        branch,
+        pr.report_date.isoformat(),
+        pr.shift,
+        (pr.staff or "").lower(),
+        str(pr.cashbox_total or ""),
+        str(pr.services_total or ""),
+        str(pr.services_cash or ""),
+        str(pr.services_kaspi or ""),
+        str(pr.drinks_total or ""),
+        str(pr.drinks_cash or ""),
+        str(pr.drinks_kaspi or ""),
+        str(pr.withdraw_total or 0),
+        str(pr.purchase_total or 0),
+        str(pr.refund_total or 0),
+        raw_norm[:600],
+    ])
+    return hashlib.sha1(base.encode("utf-8")).hexdigest()
+
+
+# =========================
+# VALIDATION / MESSAGES
+# =========================
+
 def check_mismatches(pr: ParsedReport) -> List[str]:
     warns = []
 
-    # 1) Напитки: total == cash+kaspi
+    # Услуги: total == cash+kaspi
+    if pr.services_total is not None and pr.services_cash is not None and pr.services_kaspi is not None:
+        if pr.services_total != pr.services_cash + pr.services_kaspi:
+            warns.append(
+                f"⚠️ *Услуги не сходятся:* {pr.services_total} ≠ {pr.services_cash}+{pr.services_kaspi}"
+            )
+
+    # Напитки: total == cash+kaspi
     if pr.drinks_total is not None and pr.drinks_cash is not None and pr.drinks_kaspi is not None:
         if pr.drinks_total != pr.drinks_cash + pr.drinks_kaspi:
             warns.append(
                 f"⚠️ *Напитки не сходятся:* {pr.drinks_total} ≠ {pr.drinks_cash}+{pr.drinks_kaspi}"
             )
 
-    # 2) Общая касса: cashbox_total == услуги + напитки
-    # услуги = services_cash + services_kaspi
+    # Общая касса: если указали "Общая касса", проверим что она = услуги+напитки (если оба известны)
     if pr.cashbox_total is not None and pr.services_total is not None and pr.drinks_total is not None:
         if pr.cashbox_total != pr.services_total + pr.drinks_total:
             warns.append(
@@ -388,11 +409,13 @@ def report_summary_line(branch: str, pr: ParsedReport) -> str:
     staff = f" ({pr.staff})" if pr.staff else ""
     return (
         f"*{branch_name(branch)}* | {dt} — {shift_name(pr.shift)}{staff}: "
-        f"услуги *{fmt_money(pr.services_total)}*, напитки *{fmt_money(pr.drinks_total)}*, общая *{fmt_money(pr.cashbox_total)}*"
+        f"услуги *{fmt_money(pr.services_total)}*, напитки *{fmt_money(pr.drinks_total)}*, "
+        f"общая *{fmt_money(pr.cashbox_total)}*"
     )
 
+
 # =========================
-# STORE / FETCH
+# STORE / QUERY
 # =========================
 
 def save_report(chat_id: int, branch: str, pr: ParsedReport) -> Tuple[bool, Optional[int]]:
@@ -436,9 +459,7 @@ def fetch_range(branch: str, start: date, end: date) -> List[sqlite3.Row]:
     WHERE branch = ?
       AND report_date >= ?
       AND report_date <= ?
-    ORDER BY report_date ASC,
-             CASE shift WHEN 'day' THEN 0 ELSE 1 END ASC,
-             created_at ASC
+    ORDER BY report_date ASC, shift ASC, created_at ASC
     """, (branch, start.isoformat(), end.isoformat()))
     rows = cur.fetchall()
     conn.close()
@@ -446,24 +467,17 @@ def fetch_range(branch: str, start: date, end: date) -> List[sqlite3.Row]:
 
 
 def fetch_day(branch: str, day: date) -> List[sqlite3.Row]:
-    conn = db()
-    cur = conn.cursor()
-    cur.execute("""
-    SELECT * FROM reports
-    WHERE branch = ?
-      AND report_date = ?
-    ORDER BY CASE shift WHEN 'day' THEN 0 ELSE 1 END ASC, created_at ASC
-    """, (branch, day.isoformat()))
-    rows = cur.fetchall()
-    conn.close()
-    return rows
+    return fetch_range(branch, day, day)
+
 
 # =========================
-# DIGEST
+# DIGEST (Красивый дайджест)
 # =========================
 
-def compute_last_week_window(now: datetime) -> Tuple[date, date]:
-    """Прошлая неделя (Пн-Вс)."""
+def compute_week_window(now: datetime) -> Tuple[date, date]:
+    """
+    В понедельник 11:00 считаем прошлую неделю (Пн-Вс).
+    """
     today = now.date()
     weekday = today.weekday()  # Monday=0
     this_monday = today - timedelta(days=weekday)
@@ -472,124 +486,151 @@ def compute_last_week_window(now: datetime) -> Tuple[date, date]:
     return last_monday, last_sunday
 
 
-def compute_month_window(mm_yyyy: Optional[str]) -> Tuple[date, date]:
-    """Окно месяца. Если None — текущий месяц до сегодня."""
-    now = datetime.now(TZ)
-    if not mm_yyyy:
-        start = date(now.year, now.month, 1)
-        end = now.date()
-        return start, end
-
-    m = re.match(r"^\s*(\d{2})\.(\d{4})\s*$", mm_yyyy)
-    if not m:
-        raise ValueError("Format must be MM.YYYY (например 02.2026)")
-    mm = int(m.group(1))
-    yy = int(m.group(2))
-    start = date(yy, mm, 1)
-
-    # конец месяца
-    if mm == 12:
-        end = date(yy + 1, 1, 1) - timedelta(days=1)
-    else:
-        end = date(yy, mm + 1, 1) - timedelta(days=1)
-    return start, end
-
-
-def digest_text(branch: str, start: date, end: date, title: str) -> str:
+def digest_text(branch: str, start: date, end: date) -> str:
     rows = fetch_range(branch, start, end)
-    header = (
-        f"📊 *{title}* — *{branch_name(branch)}*\n"
-        f"Период: *{start.strftime('%d.%m.%Y')} — {end.strftime('%d.%m.%Y')}*"
-    )
+    title = f"📊 *Недельный дайджест* — *{branch_name(branch)}*"
+    period = f"Период: *{start.strftime('%d.%m.%Y')} — {end.strftime('%d.%m.%Y')}*"
+
     if not rows:
-        return header + "\n\n❌ Нет сохранённых отчётов за период."
+        return f"{title}\n{period}\n\n❌ Нет сохранённых отчётов за период."
 
-    shifts_count = len(rows)
+    # totals
+    shifts_count = 0
 
-    serv_total = sum((r["services_total"] or 0) for r in rows)
-    serv_cash = sum((r["services_cash"] or 0) for r in rows)
-    serv_kaspi = sum((r["services_kaspi"] or 0) for r in rows)
+    services_total = services_cash = services_kaspi = 0
+    drinks_total = drinks_cash = drinks_kaspi = 0
+    cashbox_total = 0
 
-    drink_total = sum((r["drinks_total"] or 0) for r in rows)
-    drink_cash = sum((r["drinks_cash"] or 0) for r in rows)
-    drink_kaspi = sum((r["drinks_kaspi"] or 0) for r in rows)
+    withdraw_total = purchase_total = refund_total = 0
 
-    cashbox_total = sum((r["cashbox_total"] or 0) for r in rows)
+    # by day
+    by_day: Dict[str, Dict[str, int]] = {}  # serv, drink, cashbox, shifts
 
-    withdraw_total = sum((r["withdraw_total"] or 0) for r in rows)
-    purchase_total = sum((r["purchase_total"] or 0) for r in rows)
-    refund_total = sum((r["refund_total"] or 0) for r in rows)
-
-    by_day: Dict[str, Dict[str, int]] = {}
     for r in rows:
-        dkey = r["report_date"]  # YYYY-MM-DD
-        if dkey not in by_day:
-            by_day[dkey] = {"serv": 0, "drink": 0, "total": 0}
+        shifts_count += 1
+
         st = r["services_total"] or 0
+        sc = r["services_cash"] or 0
+        sk = r["services_kaspi"] or 0
+
         dt = r["drinks_total"] or 0
-        tt = (r["cashbox_total"] or 0) or (st + dt)
+        dc = r["drinks_cash"] or 0
+        dk = r["drinks_kaspi"] or 0
+
+        cb = r["cashbox_total"] or (st + dt)
+
+        wd = r["withdraw_total"] or 0
+        pc = r["purchase_total"] or 0
+        rf = r["refund_total"] or 0
+
+        services_total += st
+        services_cash += sc
+        services_kaspi += sk
+
+        drinks_total += dt
+        drinks_cash += dc
+        drinks_kaspi += dk
+
+        cashbox_total += cb
+
+        withdraw_total += wd
+        purchase_total += pc
+        refund_total += rf
+
+        dkey = r["report_date"]
+        if dkey not in by_day:
+            by_day[dkey] = {"serv": 0, "drink": 0, "cashbox": 0, "shifts": 0}
         by_day[dkey]["serv"] += st
         by_day[dkey]["drink"] += dt
-        by_day[dkey]["total"] += tt
+        by_day[dkey]["cashbox"] += cb
+        by_day[dkey]["shifts"] += 1
 
-    # лучший день
-    best_day, best_val = None, -1
-    for dkey, v in by_day.items():
-        if v["total"] > best_val:
-            best_val = v["total"]
+    grand_total = services_total + drinks_total
+
+    # best day by (serv+drink)
+    best_day = None
+    best_val = -1
+    for dkey, vals in by_day.items():
+        v = vals["serv"] + vals["drink"]
+        if v > best_val:
+            best_val = v
             best_day = dkey
 
-    lines = [header, ""]
+    lines = []
+    lines.append(title)
+    lines.append(period)
+    lines.append("")
     lines.append(f"✅ Принято смен: *{shifts_count}*")
     lines.append("")
-    lines.append("💰 *Итоги*")
-    lines.append(f"• Услуги: *{fmt_money(serv_total)}*  (нал {fmt_money(serv_cash)} / каспи {fmt_money(serv_kaspi)})")
-    lines.append(f"• Напитки: *{fmt_money(drink_total)}* (нал {fmt_money(drink_cash)} / каспи {fmt_money(drink_kaspi)})")
-    lines.append(f"• Общая касса (сумма): *{fmt_money(cashbox_total)}*")
+    lines.append("💰 *Итого за неделю*")
+    lines.append(f"• Услуги: *{fmt_money(services_total)}*  (нал {fmt_money(services_cash)} / каспи {fmt_money(services_kaspi)})")
+    lines.append(f"• Напитки: *{fmt_money(drinks_total)}* (нал {fmt_money(drinks_cash)} / каспи {fmt_money(drinks_kaspi)})")
+    lines.append(f"• Общий итог (услуги+напитки): *{fmt_money(grand_total)}*")
     lines.append("")
-    lines.append("🧾 *Операции*")
-    lines.append(f"• Изъятие: *{fmt_money(withdraw_total)}*")
-    lines.append(f"• Закуп: *{fmt_money(purchase_total)}*")
-    lines.append(f"• Возврат: *{fmt_money(refund_total)}*")
-    lines.append("")
-
-    if cashbox_total > 0:
-        share = int(round((drink_total / cashbox_total) * 100))
+    if grand_total > 0:
+        share = int(round((drinks_total / grand_total) * 100))
         lines.append(f"🥤 Доля напитков: *{share}%*")
         lines.append("")
-
     if best_day:
         bd = datetime.fromisoformat(best_day).strftime("%d.%m.%Y")
         lines.append(f"🏆 Лучший день: *{bd}* — *{fmt_money(best_val)}*")
         lines.append("")
 
-    lines.append("📅 *По дням* (услуги / напитки / общая касса)")
+    # Операции (не вычитаем из выручки — просто показываем)
+    lines.append("🧾 *Операции за неделю*")
+    lines.append(f"• Изъятие: *{fmt_money(withdraw_total)}*")
+    lines.append(f"• Закуп: *{fmt_money(purchase_total)}*")
+    lines.append(f"• Возврат: *{fmt_money(refund_total)}*")
+    lines.append("")
+
+    lines.append("📅 *По дням* (услуги / напитки / итого)")
     for dkey in sorted(by_day.keys()):
         dt_obj = datetime.fromisoformat(dkey)
         dlabel = dt_obj.strftime("%d.%m")
         v = by_day[dkey]
-        lines.append(f"• *{dlabel}*: {fmt_money(v['serv'])} / {fmt_money(v['drink'])} / *{fmt_money(v['total'])}*")
+        lines.append(
+            f"• *{dlabel}*: {fmt_money(v['serv'])} / {fmt_money(v['drink'])} / *{fmt_money(v['serv'] + v['drink'])}*"
+        )
 
     return "\n".join(lines)
+
 
 # =========================
 # COMMANDS
 # =========================
+
+def parse_ddmmyyyy(s: str) -> Optional[date]:
+    s = s.strip()
+    m = re.fullmatch(r"(\d{2})\.(\d{2})\.(\d{4})", s)
+    if not m:
+        return None
+    return date(int(m.group(3)), int(m.group(2)), int(m.group(1)))
+
+
+def parse_mmyyyy(s: str) -> Optional[Tuple[int, int]]:
+    s = s.strip()
+    m = re.fullmatch(r"(\d{2})\.(\d{4})", s)
+    if not m:
+        return None
+    mm, yyyy = int(m.group(1)), int(m.group(2))
+    if mm < 1 or mm > 12:
+        return None
+    return mm, yyyy
+
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     txt = (
         "Команды:\n"
         "• /help — помощь\n"
         "• /whoami — твой user_id\n"
-        "• /week — последние 7 дней (по этому филиалу)\n"
+        "• /week — статистика за последние 7 дней\n"
         "• /day 06.02.2026 — сводка за день\n"
         "• /month 02.2026 — сводка за месяц\n"
-        "• /digest_week — дайджест прошлой недели\n"
-        "• /digest_month 02.2026 — дайджест месяца\n\n"
+        "• /digest_week — вручную отправить недельный дайджест (прошлая неделя)\n\n"
         "Как слать отчёт:\n"
-        "• В одном сообщении можно 1-2 отчёта\n"
-        "• Напитки — отдельным блоком (как сейчас)\n"
-        "• Изъятие/Закуп/Возврат можно писать строками ниже заголовка — бот поймёт."
+        "— обязательно указывать ДАТУ и СМЕНУ (День/Ночь)\n"
+        "— 'Напитки' пишите отдельным блоком, как обычно\n"
+        "— можно 2 отчёта одним сообщением (ночь и день)\n"
     )
     await update.message.reply_text(txt)
 
@@ -609,7 +650,23 @@ async def cmd_week(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     now = datetime.now(TZ)
     end = now.date()
     start = end - timedelta(days=6)
-    msg = digest_text(branch, start, end, title="Сводка за 7 дней")
+    rows = fetch_range(branch, start, end)
+
+    if not rows:
+        await update.message.reply_text("Нет сохранённых отчётов за последние 7 дней.")
+        return
+
+    serv = sum((r["services_total"] or 0) for r in rows)
+    drink = sum((r["drinks_total"] or 0) for r in rows)
+    total = serv + drink
+
+    msg = (
+        f"📈 *Последние 7 дней* — *{branch_name(branch)}*\n"
+        f"Период: *{start.strftime('%d.%m.%Y')} — {end.strftime('%d.%m.%Y')}*\n\n"
+        f"• Услуги: *{fmt_money(serv)}*\n"
+        f"• Напитки: *{fmt_money(drink)}*\n"
+        f"• Итог: *{fmt_money(total)}*"
+    )
     await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
 
 
@@ -624,12 +681,11 @@ async def cmd_day(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text("Пример: /day 06.02.2026")
         return
 
-    m = DATE_RE.search(" ".join(context.args))
-    if not m:
-        await update.message.reply_text("Неверный формат даты. Пример: /day 06.02.2026")
+    d = parse_ddmmyyyy(context.args[0])
+    if not d:
+        await update.message.reply_text("Неверный формат. Пример: /day 06.02.2026")
         return
 
-    d = date(int(m.group(3)), int(m.group(2)), int(m.group(1)))
     rows = fetch_day(branch, d)
     if not rows:
         await update.message.reply_text("Нет отчётов за этот день.")
@@ -637,25 +693,17 @@ async def cmd_day(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     serv = sum((r["services_total"] or 0) for r in rows)
     drink = sum((r["drinks_total"] or 0) for r in rows)
-    total = sum((r["cashbox_total"] or 0) for r in rows)
+    total = serv + drink
+    shifts = len(rows)
 
-    lines = [
-        f"📌 *Сводка за {d.strftime('%d.%m.%Y')}* — *{branch_name(branch)}*",
-        "",
-        f"• Услуги: *{fmt_money(serv)}*",
-        f"• Напитки: *{fmt_money(drink)}*",
-        f"• Общая касса: *{fmt_money(total)}*",
-        "",
-        "Смены:"
-    ]
-    for r in rows:
-        lines.append(
-            f"• {shift_name(r['shift'])}"
-            f"{' (' + r['staff'] + ')' if r['staff'] else ''}: "
-            f"услуги {fmt_money(r['services_total'])}, напитки {fmt_money(r['drinks_total'])}, общая {fmt_money(r['cashbox_total'])}"
-        )
-
-    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
+    msg = (
+        f"📌 *Сводка за {d.strftime('%d.%m.%Y')}* — *{branch_name(branch)}*\n"
+        f"✅ Смен: *{shifts}*\n\n"
+        f"• Услуги: *{fmt_money(serv)}*\n"
+        f"• Напитки: *{fmt_money(drink)}*\n"
+        f"• Итог: *{fmt_money(total)}*"
+    )
+    await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
 
 
 async def cmd_month(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -665,14 +713,40 @@ async def cmd_month(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text("Этот чат не привязан к филиалу (t/k).")
         return
 
-    arg = " ".join(context.args).strip() if context.args else None
-    try:
-        start, end = compute_month_window(arg)
-    except ValueError as e:
-        await update.message.reply_text(str(e))
+    if not context.args:
+        await update.message.reply_text("Пример: /month 02.2026")
         return
 
-    msg = digest_text(branch, start, end, title="Сводка за месяц")
+    parsed = parse_mmyyyy(context.args[0])
+    if not parsed:
+        await update.message.reply_text("Неверный формат. Пример: /month 02.2026")
+        return
+
+    mm, yyyy = parsed
+    start = date(yyyy, mm, 1)
+    if mm == 12:
+        end = date(yyyy + 1, 1, 1) - timedelta(days=1)
+    else:
+        end = date(yyyy, mm + 1, 1) - timedelta(days=1)
+
+    rows = fetch_range(branch, start, end)
+    if not rows:
+        await update.message.reply_text("Нет отчётов за этот месяц.")
+        return
+
+    serv = sum((r["services_total"] or 0) for r in rows)
+    drink = sum((r["drinks_total"] or 0) for r in rows)
+    total = serv + drink
+    shifts = len(rows)
+
+    msg = (
+        f"🗓️ *Месячная сводка* — *{branch_name(branch)}*\n"
+        f"Период: *{start.strftime('%d.%m.%Y')} — {end.strftime('%d.%m.%Y')}*\n"
+        f"✅ Смен: *{shifts}*\n\n"
+        f"• Услуги: *{fmt_money(serv)}*\n"
+        f"• Напитки: *{fmt_money(drink)}*\n"
+        f"• Итог: *{fmt_money(total)}*"
+    )
     await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
 
 
@@ -683,30 +757,13 @@ async def cmd_digest_week(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await update.message.reply_text("Этот чат не привязан к филиалу (t/k).")
         return
 
-    start, end = compute_last_week_window(datetime.now(TZ))
-    msg = digest_text(branch, start, end, title="Недельный отчёт")
+    start, end = compute_week_window(datetime.now(TZ))
+    msg = digest_text(branch, start, end)
     await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
 
-
-async def cmd_digest_month(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    chat_id = update.effective_chat.id
-    branch = branch_from_chat(chat_id)
-    if not branch:
-        await update.message.reply_text("Этот чат не привязан к филиалу (t/k).")
-        return
-
-    arg = " ".join(context.args).strip() if context.args else None
-    try:
-        start, end = compute_month_window(arg)
-    except ValueError as e:
-        await update.message.reply_text(str(e))
-        return
-
-    msg = digest_text(branch, start, end, title="Месячный отчёт")
-    await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
 
 # =========================
-# MESSAGE HANDLER
+# TEXT HANDLER
 # =========================
 
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -716,27 +773,27 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.effective_chat.id
     branch = branch_from_chat(chat_id)
     if not branch:
-        return  # чужие чаты игнор
+        return  # игнор чужих чатов
 
     text = update.message.text.strip()
     blocks = split_into_blocks(text)
     if not blocks:
-        return
+        return  # не похоже на отчет
 
-    parsed: List[ParsedReport] = []
+    parsed_reports: List[ParsedReport] = []
     for b in blocks:
         pr = parse_report_block(b)
         if pr:
-            parsed.append(pr)
+            parsed_reports.append(pr)
 
-    if not parsed:
+    if not parsed_reports:
         return
 
-    accepted_lines: List[str] = []
-    warns_all: List[str] = []
+    accepted_lines = []
+    warns_all = []
     dupes = 0
 
-    for pr in parsed:
+    for pr in parsed_reports:
         saved, _rid = save_report(chat_id, branch, pr)
         if not saved:
             dupes += 1
@@ -749,7 +806,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text("♻️ Этот отчёт уже был принят (дубль).")
         return
 
-    msg_parts: List[str] = []
+    msg_parts = []
     if accepted_lines:
         msg_parts.append(f"✅ Принял отчёты: *{len(accepted_lines)} шт.*")
         msg_parts.append("\n".join(accepted_lines))
@@ -763,20 +820,22 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     await update.message.reply_text("\n\n".join(msg_parts), parse_mode=ParseMode.MARKDOWN)
 
+
 # =========================
-# WEEKLY JOB
+# WEEKLY JOB (каждый понедельник 11:00)
 # =========================
 
 async def weekly_digest_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     now = datetime.now(TZ)
-    start, end = compute_last_week_window(now)
+    start, end = compute_week_window(now)
 
     for branch, chat_id in [("t", CHAT_T), ("k", CHAT_K)]:
-        msg = digest_text(branch, start, end, title="Недельный отчёт")
+        msg = digest_text(branch, start, end)
         try:
             await context.bot.send_message(chat_id=chat_id, text=msg, parse_mode=ParseMode.MARKDOWN)
         except Exception as e:
             print(f"[weekly_digest_job] failed to send to {branch} chat {chat_id}: {e}")
+
 
 # =========================
 # MAIN
@@ -791,33 +850,33 @@ def main() -> None:
         .build()
     )
 
-    # timezone для scheduler (если доступен)
-    try:
-        app.job_queue.scheduler.timezone = TZ
-    except Exception:
-        pass
+    # timezone для job_queue (чтобы понедельник 11:00 был по Asia/Almaty)
+    app.job_queue.scheduler.timezone = TZ
 
+    # commands
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("whoami", cmd_whoami))
     app.add_handler(CommandHandler("week", cmd_week))
     app.add_handler(CommandHandler("day", cmd_day))
     app.add_handler(CommandHandler("month", cmd_month))
     app.add_handler(CommandHandler("digest_week", cmd_digest_week))
-    app.add_handler(CommandHandler("digest_month", cmd_digest_month))
 
+    # text reports
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
 
+    # weekly digest schedule
     if ENABLE_WEEKLY_DIGEST:
-        # Каждый понедельник 11:00 по Asia/Almaty
+        hh, mm = WEEKLY_DIGEST_TIME.split(":")
         app.job_queue.run_daily(
             weekly_digest_job,
-            time=dtime(hour=11, minute=0),
+            time=dtime(hour=int(hh), minute=int(mm)),
             days=(0,),  # Monday
-            name="weekly_digest"
+            name="weekly_digest",
         )
 
     print("🤖 Bot started")
     app.run_polling(drop_pending_updates=True)
+
 
 if __name__ == "__main__":
     main()
