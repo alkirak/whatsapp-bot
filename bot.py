@@ -48,6 +48,15 @@ def db() -> sqlite3.Connection:
     return conn
 
 
+def ensure_column(conn: sqlite3.Connection, table: str, column: str, coldef: str) -> None:
+    cur = conn.cursor()
+    cur.execute(f"PRAGMA table_info({table});")
+    cols = {row[1] for row in cur.fetchall()}  # row[1] = name
+    if column not in cols:
+        cur.execute(f"ALTER TABLE {table} ADD COLUMN {column} {coldef};")
+        conn.commit()
+
+
 def init_db() -> None:
     conn = db()
     cur = conn.cursor()
@@ -81,6 +90,25 @@ def init_db() -> None:
     cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_reports_fingerprint ON reports(fingerprint);")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_reports_branch_date ON reports(branch, report_date);")
     conn.commit()
+
+    # ✅ Миграция: добавляем salary_total (если базы уже существуют)
+    ensure_column(conn, "reports", "salary_total", "INTEGER DEFAULT 0")
+
+    # ✅ Таблица выплат зарплаты (чтобы считать "кто сколько получил")
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS salary_payments (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        report_id INTEGER NOT NULL,
+        name TEXT NOT NULL,
+        amount INTEGER NOT NULL,
+        created_at TEXT NOT NULL,
+        FOREIGN KEY(report_id) REFERENCES reports(id) ON DELETE CASCADE
+    );
+    """)
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_salary_payments_report_id ON salary_payments(report_id);")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_salary_payments_name ON salary_payments(name);")
+    conn.commit()
+
     conn.close()
 
 
@@ -107,6 +135,9 @@ class ParsedReport:
     withdraw_total: int
     purchase_total: int
     refund_total: int
+
+    salary_total: int
+    salary_by_staff: Dict[str, int]
 
     raw_block: str
 
@@ -224,7 +255,7 @@ def extract_section_with_stop(
 
 
 def extract_cashbox(block: str) -> Tuple[Optional[int], Optional[int], Optional[int]]:
-    stop = ("услуг", "напит", "изъят", "остаток", "возврат", "закуп", "преми")
+    stop = ("услуг", "напит", "изъят", "остаток", "возврат", "закуп", "преми", "зп", "зарплат", "аванс")
     return extract_section_with_stop(
         block,
         lambda low: ("общая касса" in low) or (low.startswith("общая")) or ("оборот" in low),
@@ -233,7 +264,7 @@ def extract_cashbox(block: str) -> Tuple[Optional[int], Optional[int], Optional[
 
 
 def extract_services(block: str) -> Tuple[Optional[int], Optional[int], Optional[int]]:
-    stop = ("напит", "изъят", "остаток", "возврат", "закуп", "преми", "общая касса", "оборот")
+    stop = ("напит", "изъят", "остаток", "возврат", "закуп", "преми", "общая касса", "оборот", "зп", "зарплат", "аванс")
     return extract_section_with_stop(
         block,
         lambda low: "услуг" in low,
@@ -242,7 +273,7 @@ def extract_services(block: str) -> Tuple[Optional[int], Optional[int], Optional
 
 
 def extract_drinks(block: str) -> Tuple[Optional[int], Optional[int], Optional[int]]:
-    stop = ("услуг", "изъят", "остаток", "возврат", "закуп", "преми", "общая касса", "оборот")
+    stop = ("услуг", "изъят", "остаток", "возврат", "закуп", "преми", "общая касса", "оборот", "зп", "зарплат", "аванс")
     return extract_section_with_stop(
         block,
         lambda low: "напит" in low,
@@ -260,11 +291,50 @@ def sum_inline_amounts(line: str) -> int:
     return s
 
 
-def extract_ops(block: str) -> Tuple[int, int, int]:
+SALARY_KEY_RE = re.compile(r"\b(зп|з/п|зарплат|аванс|преми)\b", re.IGNORECASE)
+
+def parse_salary_lines(block: str, default_staff: Optional[str]) -> Dict[str, int]:
+    """
+    Возвращает выплаты по людям.
+    Понимает:
+      - "ЗП: 10000" (привяжет к default_staff)
+      - "ЗП Уля: 10000" / "Зарплата Ару 8000" (привяжет к указанному имени)
+      - если нет имени и нет default_staff -> "Без имени"
+    """
+    out: Dict[str, int] = {}
+    for ln in block.split("\n"):
+        low = ln.lower()
+        if not SALARY_KEY_RE.search(low):
+            continue
+
+        amount = sum_inline_amounts(ln)
+        if amount <= 0:
+            continue
+
+        # пытаемся вытащить имя рядом с ключевым словом
+        # примеры: "ЗП Уля: 10000", "зарплата Ару 8000", "аванс-Уля 5000"
+        m = re.search(r"(зп|з/п|зарплат[аы]?|аванс|преми[яи]?)\s*[:\-]?\s*([A-Za-zА-Яа-яЁё\-]+)?", ln, re.IGNORECASE)
+        name = None
+        if m:
+            cand = m.group(2)
+            if cand and not re.search(r"\d", cand):
+                name = cand.strip()
+
+        if not name:
+            name = (default_staff or "").strip() or "Без имени"
+
+        out[name] = out.get(name, 0) + amount
+
+    return out
+
+
+def extract_ops(block: str, default_staff: Optional[str]) -> Tuple[int, int, int, int, Dict[str, int]]:
     """
     Изъятие, Закуп, Возврат - суммы чисел в строках.
+    Зарплата - отдельным парсером, с разнесением по людям.
     """
     withdraw = purchase = refund = 0
+
     for ln in block.split("\n"):
         low = ln.lower()
         if "изъят" in low:
@@ -273,7 +343,11 @@ def extract_ops(block: str) -> Tuple[int, int, int]:
             purchase += sum_inline_amounts(ln)
         if "возврат" in low:
             refund += sum_inline_amounts(ln)
-    return withdraw, purchase, refund
+
+    salary_by = parse_salary_lines(block, default_staff)
+    salary_total = sum(salary_by.values())
+
+    return withdraw, purchase, refund, salary_total, salary_by
 
 
 def parse_report_block(block: str) -> Optional[ParsedReport]:
@@ -296,7 +370,7 @@ def parse_report_block(block: str) -> Optional[ParsedReport]:
         if services_cash is not None and services_kaspi is not None:
             services_total = services_cash + services_kaspi
 
-    withdraw_total, purchase_total, refund_total = extract_ops(block)
+    withdraw_total, purchase_total, refund_total, salary_total, salary_by_staff = extract_ops(block, staff)
 
     return ParsedReport(
         report_date=d,
@@ -316,6 +390,9 @@ def parse_report_block(block: str) -> Optional[ParsedReport]:
         withdraw_total=withdraw_total,
         purchase_total=purchase_total,
         refund_total=refund_total,
+
+        salary_total=salary_total,
+        salary_by_staff=salary_by_staff,
 
         raw_block=block.strip(),
     )
@@ -368,6 +445,7 @@ def make_fingerprint(branch: str, pr: ParsedReport) -> str:
         str(pr.withdraw_total or 0),
         str(pr.purchase_total or 0),
         str(pr.refund_total or 0),
+        str(pr.salary_total or 0),
         raw_norm[:600],
     ])
     return hashlib.sha1(base.encode("utf-8")).hexdigest()
@@ -407,16 +485,31 @@ def check_mismatches(pr: ParsedReport) -> List[str]:
 def report_summary_line(branch: str, pr: ParsedReport) -> str:
     dt = pr.report_date.strftime("%d.%m.%Y")
     staff = f" ({pr.staff})" if pr.staff else ""
+    salary = f", зп *{fmt_money(pr.salary_total)}*" if pr.salary_total else ""
     return (
         f"*{branch_name(branch)}* | {dt} — {shift_name(pr.shift)}{staff}: "
         f"услуги *{fmt_money(pr.services_total)}*, напитки *{fmt_money(pr.drinks_total)}*, "
-        f"общая *{fmt_money(pr.cashbox_total)}*"
+        f"общая *{fmt_money(pr.cashbox_total)}*{salary}"
     )
 
 
 # =========================
 # STORE / QUERY
 # =========================
+
+def save_salary_payments(conn: sqlite3.Connection, report_id: int, salary_by_staff: Dict[str, int]) -> None:
+    if not salary_by_staff:
+        return
+    cur = conn.cursor()
+    now = datetime.now(TZ).isoformat(timespec="seconds")
+    for name, amount in salary_by_staff.items():
+        if not name or amount <= 0:
+            continue
+        cur.execute(
+            "INSERT INTO salary_payments (report_id, name, amount, created_at) VALUES (?, ?, ?, ?)",
+            (report_id, name, amount, now)
+        )
+
 
 def save_report(chat_id: int, branch: str, pr: ParsedReport) -> Tuple[bool, Optional[int]]:
     conn = db()
@@ -432,18 +525,24 @@ def save_report(chat_id: int, branch: str, pr: ParsedReport) -> Tuple[bool, Opti
             services_total, services_cash, services_kaspi,
             drinks_total, drinks_cash, drinks_kaspi,
             withdraw_total, purchase_total, refund_total,
+            salary_total,
             raw, fingerprint, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             chat_id, branch, pr.report_date.isoformat(), pr.shift, pr.staff,
             pr.cashbox_total,
             pr.services_total, pr.services_cash, pr.services_kaspi,
             pr.drinks_total, pr.drinks_cash, pr.drinks_kaspi,
             pr.withdraw_total, pr.purchase_total, pr.refund_total,
+            pr.salary_total,
             pr.raw_block, fp, now
         ))
-        conn.commit()
         rid = cur.lastrowid
+
+        # ✅ сохраняем выплаты по людям для "кто сколько получил"
+        save_salary_payments(conn, rid, pr.salary_by_staff)
+
+        conn.commit()
         conn.close()
         return True, rid
     except sqlite3.IntegrityError:
@@ -468,6 +567,58 @@ def fetch_range(branch: str, start: date, end: date) -> List[sqlite3.Row]:
 
 def fetch_day(branch: str, day: date) -> List[sqlite3.Row]:
     return fetch_range(branch, day, day)
+
+
+def fetch_salary_breakdown_for_reports(report_ids: List[int]) -> Dict[str, int]:
+    """
+    Возвращает сумму зарплат по именам по списку report_id.
+    """
+    if not report_ids:
+        return {}
+    conn = db()
+    cur = conn.cursor()
+    placeholders = ",".join(["?"] * len(report_ids))
+    cur.execute(f"""
+        SELECT name, SUM(amount) AS total
+        FROM salary_payments
+        WHERE report_id IN ({placeholders})
+        GROUP BY name
+    """, report_ids)
+    rows = cur.fetchall()
+    conn.close()
+    return {r["name"]: int(r["total"] or 0) for r in rows}
+
+
+def period_ops_and_salary(rows: List[sqlite3.Row]) -> Tuple[int, int, int, int, Dict[str, int]]:
+    """
+    withdraw, purchase, refund, salary_total, salary_by_name
+    """
+    withdraw = purchase = refund = 0
+    report_ids: List[int] = []
+
+    # операции берём из reports
+    for r in rows:
+        withdraw += (r["withdraw_total"] or 0)
+        purchase += (r["purchase_total"] or 0)
+        refund += (r["refund_total"] or 0)
+        report_ids.append(int(r["id"]))
+
+    # зарплату по людям берём из salary_payments
+    by_name = fetch_salary_breakdown_for_reports(report_ids)
+    salary_total = sum(by_name.values())
+
+    # fallback для старых записей, если salary_payments пуст (например, отчёты до обновления)
+    if not by_name:
+        by_name = {}
+        salary_total = 0
+        for r in rows:
+            amt = (r["salary_total"] or 0)
+            salary_total += amt
+            name = (r["staff"] or "").strip() or "Без имени"
+            if amt:
+                by_name[name] = by_name.get(name, 0) + amt
+
+    return withdraw, purchase, refund, salary_total, by_name
 
 
 # =========================
@@ -556,6 +707,9 @@ def digest_text(branch: str, start: date, end: date) -> str:
             best_val = v
             best_day = dkey
 
+    # зарплата по людям за период
+    _wd, _pc, _rf, salary_total, salary_by = period_ops_and_salary(rows)
+
     lines = []
     lines.append(title)
     lines.append(period)
@@ -576,7 +730,17 @@ def digest_text(branch: str, start: date, end: date) -> str:
         lines.append(f"🏆 Лучший день: *{bd}* — *{fmt_money(best_val)}*")
         lines.append("")
 
-    # Операции (не вычитаем из выручки — просто показываем)
+    lines.append("💸 *Зарплаты за неделю*")
+    lines.append(f"• Всего: *{fmt_money(salary_total)}*")
+    if salary_by:
+        for name, val in sorted(salary_by.items()):
+            if val:
+                lines.append(f"  - {name}: *{fmt_money(val)}*")
+    else:
+        lines.append("  - —")
+    lines.append("")
+
+    # Операции
     lines.append("🧾 *Операции за неделю*")
     lines.append(f"• Изъятие: *{fmt_money(withdraw_total)}*")
     lines.append(f"• Закуп: *{fmt_money(purchase_total)}*")
@@ -630,7 +794,12 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "Как слать отчёт:\n"
         "— обязательно указывать ДАТУ и СМЕНУ (День/Ночь)\n"
         "— 'Напитки' пишите отдельным блоком, как обычно\n"
-        "— можно 2 отчёта одним сообщением (ночь и день)\n"
+        "— можно 2 отчёта одним сообщением (ночь и день)\n\n"
+        "Зарплата в отчёте (любая форма):\n"
+        "— ЗП: 10000\n"
+        "— Зарплата Уля: 12000\n"
+        "— Аванс Ару 5000\n"
+        "— Премия: 3000\n"
     )
     await update.message.reply_text(txt)
 
@@ -638,6 +807,16 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def cmd_whoami(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     uid = update.effective_user.id if update.effective_user else None
     await update.message.reply_text(f"Your user_id: {uid}")
+
+
+def format_salary_block(total: int, by_staff: Dict[str, int]) -> str:
+    if total <= 0:
+        return "💸 *Зарплата*: *0*\n—"
+    lines = [f"💸 *Зарплата*: *{fmt_money(total)}*"]
+    for name, val in sorted(by_staff.items()):
+        if val:
+            lines.append(f"• {name}: *{fmt_money(val)}*")
+    return "\n".join(lines)
 
 
 async def cmd_week(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -660,12 +839,19 @@ async def cmd_week(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     drink = sum((r["drinks_total"] or 0) for r in rows)
     total = serv + drink
 
+    wd, pc, rf, sal, by_staff = period_ops_and_salary(rows)
+
     msg = (
         f"📈 *Последние 7 дней* — *{branch_name(branch)}*\n"
         f"Период: *{start.strftime('%d.%m.%Y')} — {end.strftime('%d.%m.%Y')}*\n\n"
         f"• Услуги: *{fmt_money(serv)}*\n"
         f"• Напитки: *{fmt_money(drink)}*\n"
-        f"• Итог: *{fmt_money(total)}*"
+        f"• Итог: *{fmt_money(total)}*\n\n"
+        f"{format_salary_block(sal, by_staff)}\n\n"
+        f"🧾 *Операции*\n"
+        f"• Закуп: *{fmt_money(pc)}*\n"
+        f"• Возврат: *{fmt_money(rf)}*\n"
+        f"• Изъятие: *{fmt_money(wd)}*"
     )
     await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
 
@@ -696,12 +882,19 @@ async def cmd_day(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     total = serv + drink
     shifts = len(rows)
 
+    wd, pc, rf, sal, by_staff = period_ops_and_salary(rows)
+
     msg = (
         f"📌 *Сводка за {d.strftime('%d.%m.%Y')}* — *{branch_name(branch)}*\n"
         f"✅ Смен: *{shifts}*\n\n"
         f"• Услуги: *{fmt_money(serv)}*\n"
         f"• Напитки: *{fmt_money(drink)}*\n"
-        f"• Итог: *{fmt_money(total)}*"
+        f"• Итог: *{fmt_money(total)}*\n\n"
+        f"{format_salary_block(sal, by_staff)}\n\n"
+        f"🧾 *Операции*\n"
+        f"• Закуп: *{fmt_money(pc)}*\n"
+        f"• Возврат: *{fmt_money(rf)}*\n"
+        f"• Изъятие: *{fmt_money(wd)}*"
     )
     await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
 
@@ -739,13 +932,20 @@ async def cmd_month(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     total = serv + drink
     shifts = len(rows)
 
+    wd, pc, rf, sal, by_staff = period_ops_and_salary(rows)
+
     msg = (
         f"🗓️ *Месячная сводка* — *{branch_name(branch)}*\n"
         f"Период: *{start.strftime('%d.%m.%Y')} — {end.strftime('%d.%m.%Y')}*\n"
         f"✅ Смен: *{shifts}*\n\n"
         f"• Услуги: *{fmt_money(serv)}*\n"
         f"• Напитки: *{fmt_money(drink)}*\n"
-        f"• Итог: *{fmt_money(total)}*"
+        f"• Итог: *{fmt_money(total)}*\n\n"
+        f"{format_salary_block(sal, by_staff)}\n\n"
+        f"🧾 *Операции за месяц*\n"
+        f"• Закуп: *{fmt_money(pc)}*\n"
+        f"• Возврат: *{fmt_money(rf)}*\n"
+        f"• Изъятие: *{fmt_money(wd)}*"
     )
     await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
 
