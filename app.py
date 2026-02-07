@@ -143,13 +143,32 @@ def fmt_money(n):
 
 def validate_report(r):
     warnings = []
-    if r.get("total") is not None and r.get("cash") is not None and r.get("kaspi") is not None:
-        if r["total"] != (r["cash"] + r["kaspi"]):
-            warnings.append(f"⚠️ Общая касса не сходится: {r['total']} ≠ {r['cash']}+{r['kaspi']}")
-    if r.get("drinks_total") is not None and r.get("drinks_cash") is not None and r.get("drinks_kaspi") is not None:
-        if r["drinks_total"] != (r["drinks_cash"] + r["drinks_kaspi"]):
-            warnings.append(f"⚠️ Напитки не сходятся: {r['drinks_total']} ≠ {r['drinks_cash']}+{r['drinks_kaspi']}")
+
+    total = r.get("total")
+    cash = r.get("cash")
+    kaspi = r.get("kaspi")
+    drinks_total = r.get("drinks_total")
+
+    # 1) Проверка общей кассы с учётом напитков (как у вас)
+    if total is not None and cash is not None and kaspi is not None and drinks_total is not None:
+        if total != (cash + kaspi + drinks_total):
+            warnings.append(
+                f"⚠️ Общая касса не сходится: {total} ≠ {cash}+{kaspi}+{drinks_total} (нал+каспи+напитки)"
+            )
+    elif total is not None and cash is not None and kaspi is not None:
+        # fallback если напитки не указаны
+        if total != (cash + kaspi):
+            warnings.append(f"⚠️ Общая касса не сходится: {total} ≠ {cash}+{kaspi}")
+
+    # 2) Проверка напитков по разбиению нал/каспи в секции напитков
+    dc = r.get("drinks_cash")
+    dk = r.get("drinks_kaspi")
+    if drinks_total is not None and dc is not None and dk is not None:
+        if drinks_total != (dc + dk):
+            warnings.append(f"⚠️ Напитки не сходятся: {drinks_total} ≠ {dc}+{dk}")
+
     return warnings
+
 
 def summarize_for_date(reports, date_str):
     rows = [r for r in reports if r.get("date") == date_str and r.get("total") is not None]
