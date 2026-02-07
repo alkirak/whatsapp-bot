@@ -609,9 +609,9 @@ def main() -> None:
     app: Application = (
         ApplicationBuilder()
         .token(BOT_TOKEN)
-        .timezone(TZ)
-        .build()
+        .build() 
     )
+    app.job_queue.scheduler.timezone = TZ
 
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("whoami", cmd_whoami))
