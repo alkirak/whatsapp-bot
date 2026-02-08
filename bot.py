@@ -1,12 +1,14 @@
-# bot.py
+# bot.py (PostgreSQL)
 import os
 import re
-import sqlite3
 import hashlib
 from dataclasses import dataclass
 from datetime import datetime, date, timedelta, time as dtime
 from zoneinfo import ZoneInfo
 from typing import Optional, List, Dict, Tuple
+
+import psycopg2
+import psycopg2.extras
 
 from telegram import Update
 from telegram.constants import ParseMode
@@ -24,11 +26,14 @@ from telegram.ext import (
 # =========================
 
 TZ = ZoneInfo(os.getenv("TZ", "Asia/Almaty"))
-DB_PATH = os.getenv("DB_PATH", "data.db")
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is empty. Set env var BOT_TOKEN in Railway.")
+
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
+if not DATABASE_URL:
+    raise RuntimeError("DATABASE_URL is empty. Add PostgreSQL in Railway and ensure DATABASE_URL exists.")
 
 # Привязка чатов к филиалам:
 # t = Turkistan, k = Kentau
@@ -38,77 +43,79 @@ CHAT_K = int(os.getenv("CHAT_K", "-5277664922"))
 ENABLE_WEEKLY_DIGEST = os.getenv("ENABLE_WEEKLY_DIGEST", "1") == "1"
 WEEKLY_DIGEST_TIME = os.getenv("WEEKLY_DIGEST_TIME", "11:00")  # понедельник 11:00
 
+
 # =========================
-# DB
+# DB (PostgreSQL)
 # =========================
 
-def db() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-    conn.row_factory = sqlite3.Row
+def db() -> psycopg2.extensions.connection:
+    """
+    Railway Postgres обычно требует SSL. Если в DATABASE_URL нет sslmode,
+    добавляем sslmode=require.
+    """
+    dsn = DATABASE_URL
+    if "sslmode=" not in dsn:
+        joiner = "&" if "?" in dsn else "?"
+        dsn = dsn + f"{joiner}sslmode=require"
+
+    conn = psycopg2.connect(dsn)
     return conn
-
-
-def ensure_column(conn: sqlite3.Connection, table: str, column: str, coldef: str) -> None:
-    cur = conn.cursor()
-    cur.execute(f"PRAGMA table_info({table});")
-    cols = {row[1] for row in cur.fetchall()}  # row[1] = name
-    if column not in cols:
-        cur.execute(f"ALTER TABLE {table} ADD COLUMN {column} {coldef};")
-        conn.commit()
 
 
 def init_db() -> None:
     conn = db()
     cur = conn.cursor()
+
+    # Основная таблица отчётов
     cur.execute("""
     CREATE TABLE IF NOT EXISTS reports (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        chat_id INTEGER NOT NULL,
+        id SERIAL PRIMARY KEY,
+        chat_id BIGINT NOT NULL,
         branch TEXT NOT NULL,              -- 't' or 'k'
-        report_date TEXT NOT NULL,         -- YYYY-MM-DD
+        report_date DATE NOT NULL,
         shift TEXT NOT NULL,               -- 'day' or 'night'
         staff TEXT,
 
-        cashbox_total INTEGER,             -- "Общая касса" (если есть)
-        services_total INTEGER,            -- "Услуги" (или вычислено)
+        cashbox_total INTEGER,
+        services_total INTEGER,
         services_cash INTEGER,
         services_kaspi INTEGER,
 
-        drinks_total INTEGER,              -- "Напитки"
+        drinks_total INTEGER,
         drinks_cash INTEGER,
         drinks_kaspi INTEGER,
 
-        withdraw_total INTEGER DEFAULT 0,  -- Изъятие (сумма чисел)
-        purchase_total INTEGER DEFAULT 0,  -- Закуп
-        refund_total INTEGER DEFAULT 0,    -- Возврат
+        withdraw_total INTEGER DEFAULT 0,
+        purchase_total INTEGER DEFAULT 0,
+        refund_total INTEGER DEFAULT 0,
+
+        salary_total INTEGER DEFAULT 0,
 
         raw TEXT NOT NULL,
         fingerprint TEXT NOT NULL,
-        created_at TEXT NOT NULL
+        created_at TIMESTAMPTZ NOT NULL
     );
     """)
+
+    # Индексы
     cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_reports_fingerprint ON reports(fingerprint);")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_reports_branch_date ON reports(branch, report_date);")
-    conn.commit()
 
-    # ✅ Миграция: добавляем salary_total (если базы уже существуют)
-    ensure_column(conn, "reports", "salary_total", "INTEGER DEFAULT 0")
-
-    # ✅ Таблица выплат зарплаты (чтобы считать "кто сколько получил")
+    # Таблица выплат зарплаты по людям (для корректного “кто сколько получил”)
     cur.execute("""
     CREATE TABLE IF NOT EXISTS salary_payments (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        report_id INTEGER NOT NULL,
+        id SERIAL PRIMARY KEY,
+        report_id INTEGER NOT NULL REFERENCES reports(id) ON DELETE CASCADE,
         name TEXT NOT NULL,
         amount INTEGER NOT NULL,
-        created_at TEXT NOT NULL,
-        FOREIGN KEY(report_id) REFERENCES reports(id) ON DELETE CASCADE
+        created_at TIMESTAMPTZ NOT NULL
     );
     """)
     cur.execute("CREATE INDEX IF NOT EXISTS idx_salary_payments_report_id ON salary_payments(report_id);")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_salary_payments_name ON salary_payments(name);")
-    conn.commit()
 
+    conn.commit()
+    cur.close()
     conn.close()
 
 
@@ -158,7 +165,8 @@ def norm_int(s: str) -> Optional[int]:
         return None
 
 
-DATE_RE = re.compile(r"(\d{2})\.(\d{2})\.(\d{4})")
+# ✅ принимает 6.02.2026 и 06.02.2026
+DATE_RE = re.compile(r"(\d{1,2})\.(\d{1,2})\.(\d{4})")
 SHIFT_RE = re.compile(r"\b(ночь|ночная|ноч)\b|\b(день|дневная|днев)\b", re.IGNORECASE)
 
 
@@ -178,14 +186,13 @@ def detect_date(text: str) -> Optional[date]:
     if not m:
         return None
     dd, mm, yyyy = int(m.group(1)), int(m.group(2)), int(m.group(3))
-    return date(yyyy, mm, dd)
+    try:
+        return date(yyyy, mm, dd)
+    except ValueError:
+        return None
 
 
 def split_into_blocks(text: str) -> List[str]:
-    """
-    В одном сообщении может быть 1-2+ отчёта.
-    Делим по вхождениям даты (каждая дата обычно начало отчёта).
-    """
     text = text.replace("\r\n", "\n")
     positions = [m.start() for m in DATE_RE.finditer(text)]
     if not positions:
@@ -202,7 +209,6 @@ def split_into_blocks(text: str) -> List[str]:
 
 
 def extract_staff(block: str) -> Optional[str]:
-    # Пример: "06.02.2026г. Ночь смена Уля" или "День смена Ару"
     for line in block.split("\n"):
         if "смен" in line.lower():
             m = re.search(r"смена\s+([A-Za-zА-Яа-яЁё\-]+)", line, re.IGNORECASE)
@@ -216,13 +222,6 @@ def extract_section_with_stop(
     title_predicate,
     stop_markers: Tuple[str, ...],
 ) -> Tuple[Optional[int], Optional[int], Optional[int]]:
-    """
-    Универсально для секций вида:
-      <title>: <total>
-      Нал: <cash>
-      Каспи: <kaspi>
-    Важно: как только встретили другой раздел (stop_markers) — прекращаем.
-    """
     lines = [ln.strip() for ln in block.split("\n") if ln.strip()]
     total = cash = kaspi = None
 
@@ -235,8 +234,6 @@ def extract_section_with_stop(
 
             for j in range(i + 1, min(i + 12, len(lines))):
                 l2 = lines[j].lower()
-
-                # стоп, если начался другой раздел
                 if any(sm in l2 for sm in stop_markers):
                     break
 
@@ -294,13 +291,6 @@ def sum_inline_amounts(line: str) -> int:
 SALARY_KEY_RE = re.compile(r"\b(зп|з/п|зарплат|аванс|преми)\b", re.IGNORECASE)
 
 def parse_salary_lines(block: str, default_staff: Optional[str]) -> Dict[str, int]:
-    """
-    Возвращает выплаты по людям.
-    Понимает:
-      - "ЗП: 10000" (привяжет к default_staff)
-      - "ЗП Уля: 10000" / "Зарплата Ару 8000" (привяжет к указанному имени)
-      - если нет имени и нет default_staff -> "Без имени"
-    """
     out: Dict[str, int] = {}
     for ln in block.split("\n"):
         low = ln.lower()
@@ -311,8 +301,6 @@ def parse_salary_lines(block: str, default_staff: Optional[str]) -> Dict[str, in
         if amount <= 0:
             continue
 
-        # пытаемся вытащить имя рядом с ключевым словом
-        # примеры: "ЗП Уля: 10000", "зарплата Ару 8000", "аванс-Уля 5000"
         m = re.search(r"(зп|з/п|зарплат[аы]?|аванс|преми[яи]?)\s*[:\-]?\s*([A-Za-zА-Яа-яЁё\-]+)?", ln, re.IGNORECASE)
         name = None
         if m:
@@ -329,10 +317,6 @@ def parse_salary_lines(block: str, default_staff: Optional[str]) -> Dict[str, in
 
 
 def extract_ops(block: str, default_staff: Optional[str]) -> Tuple[int, int, int, int, Dict[str, int]]:
-    """
-    Изъятие, Закуп, Возврат - суммы чисел в строках.
-    Зарплата - отдельным парсером, с разнесением по людям.
-    """
     withdraw = purchase = refund = 0
 
     for ln in block.split("\n"):
@@ -362,8 +346,6 @@ def parse_report_block(block: str) -> Optional[ParsedReport]:
     services_total, services_cash, services_kaspi = extract_services(block)
     drinks_total, drinks_cash, drinks_kaspi = extract_drinks(block)
 
-    # Если "Услуги:" не написали — считаем услуги как нал+каспи из "Общая касса"
-    # (это "услуги", напитки отдельно)
     if services_total is None and services_cash is None and services_kaspi is None:
         services_cash = cashbox_cash
         services_kaspi = cashbox_kaspi
@@ -458,26 +440,17 @@ def make_fingerprint(branch: str, pr: ParsedReport) -> str:
 def check_mismatches(pr: ParsedReport) -> List[str]:
     warns = []
 
-    # Услуги: total == cash+kaspi
     if pr.services_total is not None and pr.services_cash is not None and pr.services_kaspi is not None:
         if pr.services_total != pr.services_cash + pr.services_kaspi:
-            warns.append(
-                f"⚠️ *Услуги не сходятся:* {pr.services_total} ≠ {pr.services_cash}+{pr.services_kaspi}"
-            )
+            warns.append(f"⚠️ *Услуги не сходятся:* {pr.services_total} ≠ {pr.services_cash}+{pr.services_kaspi}")
 
-    # Напитки: total == cash+kaspi
     if pr.drinks_total is not None and pr.drinks_cash is not None and pr.drinks_kaspi is not None:
         if pr.drinks_total != pr.drinks_cash + pr.drinks_kaspi:
-            warns.append(
-                f"⚠️ *Напитки не сходятся:* {pr.drinks_total} ≠ {pr.drinks_cash}+{pr.drinks_kaspi}"
-            )
+            warns.append(f"⚠️ *Напитки не сходятся:* {pr.drinks_total} ≠ {pr.drinks_cash}+{pr.drinks_kaspi}")
 
-    # Общая касса: если указали "Общая касса", проверим что она = услуги+напитки (если оба известны)
     if pr.cashbox_total is not None and pr.services_total is not None and pr.drinks_total is not None:
         if pr.cashbox_total != pr.services_total + pr.drinks_total:
-            warns.append(
-                f"⚠️ *Общая касса не сходится:* {pr.cashbox_total} ≠ {pr.services_total}+{pr.drinks_total} (услуги+напитки)"
-            )
+            warns.append(f"⚠️ *Общая касса не сходится:* {pr.cashbox_total} ≠ {pr.services_total}+{pr.drinks_total} (услуги+напитки)")
 
     return warns
 
@@ -494,28 +467,29 @@ def report_summary_line(branch: str, pr: ParsedReport) -> str:
 
 
 # =========================
-# STORE / QUERY
+# STORE / QUERY (Postgres)
 # =========================
 
-def save_salary_payments(conn: sqlite3.Connection, report_id: int, salary_by_staff: Dict[str, int]) -> None:
+def save_salary_payments(conn, report_id: int, salary_by_staff: Dict[str, int]) -> None:
     if not salary_by_staff:
         return
     cur = conn.cursor()
-    now = datetime.now(TZ).isoformat(timespec="seconds")
+    now = datetime.now(TZ)
     for name, amount in salary_by_staff.items():
         if not name or amount <= 0:
             continue
         cur.execute(
-            "INSERT INTO salary_payments (report_id, name, amount, created_at) VALUES (?, ?, ?, ?)",
+            "INSERT INTO salary_payments (report_id, name, amount, created_at) VALUES (%s, %s, %s, %s)",
             (report_id, name, amount, now)
         )
+    cur.close()
 
 
 def save_report(chat_id: int, branch: str, pr: ParsedReport) -> Tuple[bool, Optional[int]]:
     conn = db()
     cur = conn.cursor()
     fp = make_fingerprint(branch, pr)
-    now = datetime.now(TZ).isoformat(timespec="seconds")
+    now = datetime.now(TZ)
 
     try:
         cur.execute("""
@@ -527,9 +501,10 @@ def save_report(chat_id: int, branch: str, pr: ParsedReport) -> Tuple[bool, Opti
             withdraw_total, purchase_total, refund_total,
             salary_total,
             raw, fingerprint, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+        RETURNING id
         """, (
-            chat_id, branch, pr.report_date.isoformat(), pr.shift, pr.staff,
+            chat_id, branch, pr.report_date, pr.shift, pr.staff,
             pr.cashbox_total,
             pr.services_total, pr.services_cash, pr.services_kaspi,
             pr.drinks_total, pr.drinks_cash, pr.drinks_kaspi,
@@ -537,84 +512,86 @@ def save_report(chat_id: int, branch: str, pr: ParsedReport) -> Tuple[bool, Opti
             pr.salary_total,
             pr.raw_block, fp, now
         ))
-        rid = cur.lastrowid
+        rid = cur.fetchone()[0]
 
-        # ✅ сохраняем выплаты по людям для "кто сколько получил"
         save_salary_payments(conn, rid, pr.salary_by_staff)
 
         conn.commit()
+        cur.close()
         conn.close()
         return True, rid
-    except sqlite3.IntegrityError:
+
+    except psycopg2.errors.UniqueViolation:
+        conn.rollback()
+        cur.close()
         conn.close()
         return False, None
+    except Exception:
+        conn.rollback()
+        cur.close()
+        conn.close()
+        raise
 
 
-def fetch_range(branch: str, start: date, end: date) -> List[sqlite3.Row]:
+def fetch_range(branch: str, start: date, end: date) -> List[Dict]:
     conn = db()
-    cur = conn.cursor()
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
     cur.execute("""
-    SELECT * FROM reports
-    WHERE branch = ?
-      AND report_date >= ?
-      AND report_date <= ?
+    SELECT *
+    FROM reports
+    WHERE branch = %s
+      AND report_date >= %s
+      AND report_date <= %s
     ORDER BY report_date ASC, shift ASC, created_at ASC
-    """, (branch, start.isoformat(), end.isoformat()))
+    """, (branch, start, end))
     rows = cur.fetchall()
+    cur.close()
     conn.close()
     return rows
 
 
-def fetch_day(branch: str, day: date) -> List[sqlite3.Row]:
+def fetch_day(branch: str, day: date) -> List[Dict]:
     return fetch_range(branch, day, day)
 
 
 def fetch_salary_breakdown_for_reports(report_ids: List[int]) -> Dict[str, int]:
-    """
-    Возвращает сумму зарплат по именам по списку report_id.
-    """
     if not report_ids:
         return {}
     conn = db()
-    cur = conn.cursor()
-    placeholders = ",".join(["?"] * len(report_ids))
-    cur.execute(f"""
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cur.execute("""
         SELECT name, SUM(amount) AS total
         FROM salary_payments
-        WHERE report_id IN ({placeholders})
+        WHERE report_id = ANY(%s)
         GROUP BY name
-    """, report_ids)
+    """, (report_ids,))
     rows = cur.fetchall()
+    cur.close()
     conn.close()
     return {r["name"]: int(r["total"] or 0) for r in rows}
 
 
-def period_ops_and_salary(rows: List[sqlite3.Row]) -> Tuple[int, int, int, int, Dict[str, int]]:
-    """
-    withdraw, purchase, refund, salary_total, salary_by_name
-    """
+def period_ops_and_salary(rows: List[Dict]) -> Tuple[int, int, int, int, Dict[str, int]]:
     withdraw = purchase = refund = 0
     report_ids: List[int] = []
 
-    # операции берём из reports
     for r in rows:
-        withdraw += (r["withdraw_total"] or 0)
-        purchase += (r["purchase_total"] or 0)
-        refund += (r["refund_total"] or 0)
+        withdraw += (r.get("withdraw_total") or 0)
+        purchase += (r.get("purchase_total") or 0)
+        refund += (r.get("refund_total") or 0)
         report_ids.append(int(r["id"]))
 
-    # зарплату по людям берём из salary_payments
     by_name = fetch_salary_breakdown_for_reports(report_ids)
     salary_total = sum(by_name.values())
 
-    # fallback для старых записей, если salary_payments пуст (например, отчёты до обновления)
+    # fallback на случай если по старым данным не было salary_payments
     if not by_name:
         by_name = {}
         salary_total = 0
         for r in rows:
-            amt = (r["salary_total"] or 0)
+            amt = (r.get("salary_total") or 0)
             salary_total += amt
-            name = (r["staff"] or "").strip() or "Без имени"
+            name = (r.get("staff") or "").strip() or "Без имени"
             if amt:
                 by_name[name] = by_name.get(name, 0) + amt
 
@@ -622,13 +599,10 @@ def period_ops_and_salary(rows: List[sqlite3.Row]) -> Tuple[int, int, int, int, 
 
 
 # =========================
-# DIGEST (Красивый дайджест)
+# DIGEST
 # =========================
 
 def compute_week_window(now: datetime) -> Tuple[date, date]:
-    """
-    В понедельник 11:00 считаем прошлую неделю (Пн-Вс).
-    """
     today = now.date()
     weekday = today.weekday()  # Monday=0
     this_monday = today - timedelta(days=weekday)
@@ -645,60 +619,32 @@ def digest_text(branch: str, start: date, end: date) -> str:
     if not rows:
         return f"{title}\n{period}\n\n❌ Нет сохранённых отчётов за период."
 
-    # totals
-    shifts_count = 0
+    shifts_count = len(rows)
 
-    services_total = services_cash = services_kaspi = 0
-    drinks_total = drinks_cash = drinks_kaspi = 0
-    cashbox_total = 0
+    services_total = sum((r.get("services_total") or 0) for r in rows)
+    services_cash = sum((r.get("services_cash") or 0) for r in rows)
+    services_kaspi = sum((r.get("services_kaspi") or 0) for r in rows)
 
-    withdraw_total = purchase_total = refund_total = 0
+    drinks_total = sum((r.get("drinks_total") or 0) for r in rows)
+    drinks_cash = sum((r.get("drinks_cash") or 0) for r in rows)
+    drinks_kaspi = sum((r.get("drinks_kaspi") or 0) for r in rows)
 
-    # by day
-    by_day: Dict[str, Dict[str, int]] = {}  # serv, drink, cashbox, shifts
-
-    for r in rows:
-        shifts_count += 1
-
-        st = r["services_total"] or 0
-        sc = r["services_cash"] or 0
-        sk = r["services_kaspi"] or 0
-
-        dt = r["drinks_total"] or 0
-        dc = r["drinks_cash"] or 0
-        dk = r["drinks_kaspi"] or 0
-
-        cb = r["cashbox_total"] or (st + dt)
-
-        wd = r["withdraw_total"] or 0
-        pc = r["purchase_total"] or 0
-        rf = r["refund_total"] or 0
-
-        services_total += st
-        services_cash += sc
-        services_kaspi += sk
-
-        drinks_total += dt
-        drinks_cash += dc
-        drinks_kaspi += dk
-
-        cashbox_total += cb
-
-        withdraw_total += wd
-        purchase_total += pc
-        refund_total += rf
-
-        dkey = r["report_date"]
-        if dkey not in by_day:
-            by_day[dkey] = {"serv": 0, "drink": 0, "cashbox": 0, "shifts": 0}
-        by_day[dkey]["serv"] += st
-        by_day[dkey]["drink"] += dt
-        by_day[dkey]["cashbox"] += cb
-        by_day[dkey]["shifts"] += 1
+    withdraw_total = sum((r.get("withdraw_total") or 0) for r in rows)
+    purchase_total = sum((r.get("purchase_total") or 0) for r in rows)
+    refund_total = sum((r.get("refund_total") or 0) for r in rows)
 
     grand_total = services_total + drinks_total
 
-    # best day by (serv+drink)
+    by_day: Dict[str, Dict[str, int]] = {}
+    for r in rows:
+        dkey = r["report_date"].isoformat()
+        st = r.get("services_total") or 0
+        dt_ = r.get("drinks_total") or 0
+        if dkey not in by_day:
+            by_day[dkey] = {"serv": 0, "drink": 0}
+        by_day[dkey]["serv"] += st
+        by_day[dkey]["drink"] += dt_
+
     best_day = None
     best_val = -1
     for dkey, vals in by_day.items():
@@ -707,7 +653,6 @@ def digest_text(branch: str, start: date, end: date) -> str:
             best_val = v
             best_day = dkey
 
-    # зарплата по людям за период
     _wd, _pc, _rf, salary_total, salary_by = period_ops_and_salary(rows)
 
     lines = []
@@ -721,10 +666,12 @@ def digest_text(branch: str, start: date, end: date) -> str:
     lines.append(f"• Напитки: *{fmt_money(drinks_total)}* (нал {fmt_money(drinks_cash)} / каспи {fmt_money(drinks_kaspi)})")
     lines.append(f"• Общий итог (услуги+напитки): *{fmt_money(grand_total)}*")
     lines.append("")
+
     if grand_total > 0:
         share = int(round((drinks_total / grand_total) * 100))
         lines.append(f"🥤 Доля напитков: *{share}%*")
         lines.append("")
+
     if best_day:
         bd = datetime.fromisoformat(best_day).strftime("%d.%m.%Y")
         lines.append(f"🏆 Лучший день: *{bd}* — *{fmt_money(best_val)}*")
@@ -740,7 +687,6 @@ def digest_text(branch: str, start: date, end: date) -> str:
         lines.append("  - —")
     lines.append("")
 
-    # Операции
     lines.append("🧾 *Операции за неделю*")
     lines.append(f"• Изъятие: *{fmt_money(withdraw_total)}*")
     lines.append(f"• Закуп: *{fmt_money(purchase_total)}*")
@@ -752,9 +698,7 @@ def digest_text(branch: str, start: date, end: date) -> str:
         dt_obj = datetime.fromisoformat(dkey)
         dlabel = dt_obj.strftime("%d.%m")
         v = by_day[dkey]
-        lines.append(
-            f"• *{dlabel}*: {fmt_money(v['serv'])} / {fmt_money(v['drink'])} / *{fmt_money(v['serv'] + v['drink'])}*"
-        )
+        lines.append(f"• *{dlabel}*: {fmt_money(v['serv'])} / {fmt_money(v['drink'])} / *{fmt_money(v['serv'] + v['drink'])}*")
 
     return "\n".join(lines)
 
@@ -765,10 +709,14 @@ def digest_text(branch: str, start: date, end: date) -> str:
 
 def parse_ddmmyyyy(s: str) -> Optional[date]:
     s = s.strip()
-    m = re.fullmatch(r"(\d{2})\.(\d{2})\.(\d{4})", s)
+    m = re.fullmatch(r"(\d{1,2})\.(\d{1,2})\.(\d{4})", s)
     if not m:
         return None
-    return date(int(m.group(3)), int(m.group(2)), int(m.group(1)))
+    dd, mm, yyyy = int(m.group(1)), int(m.group(2)), int(m.group(3))
+    try:
+        return date(yyyy, mm, dd)
+    except ValueError:
+        return None
 
 
 def parse_mmyyyy(s: str) -> Optional[Tuple[int, int]]:
@@ -780,6 +728,16 @@ def parse_mmyyyy(s: str) -> Optional[Tuple[int, int]]:
     if mm < 1 or mm > 12:
         return None
     return mm, yyyy
+
+
+def format_salary_block(total: int, by_staff: Dict[str, int]) -> str:
+    if total <= 0:
+        return "💸 *Зарплата*: *0*\n—"
+    lines = [f"💸 *Зарплата*: *{fmt_money(total)}*"]
+    for name, val in sorted(by_staff.items()):
+        if val:
+            lines.append(f"• {name}: *{fmt_money(val)}*")
+    return "\n".join(lines)
 
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -795,7 +753,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "— обязательно указывать ДАТУ и СМЕНУ (День/Ночь)\n"
         "— 'Напитки' пишите отдельным блоком, как обычно\n"
         "— можно 2 отчёта одним сообщением (ночь и день)\n\n"
-        "Зарплата в отчёте (любая форма):\n"
+        "Зарплата (любая форма):\n"
         "— ЗП: 10000\n"
         "— Зарплата Уля: 12000\n"
         "— Аванс Ару 5000\n"
@@ -807,16 +765,6 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def cmd_whoami(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     uid = update.effective_user.id if update.effective_user else None
     await update.message.reply_text(f"Your user_id: {uid}")
-
-
-def format_salary_block(total: int, by_staff: Dict[str, int]) -> str:
-    if total <= 0:
-        return "💸 *Зарплата*: *0*\n—"
-    lines = [f"💸 *Зарплата*: *{fmt_money(total)}*"]
-    for name, val in sorted(by_staff.items()):
-        if val:
-            lines.append(f"• {name}: *{fmt_money(val)}*")
-    return "\n".join(lines)
 
 
 async def cmd_week(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -835,8 +783,8 @@ async def cmd_week(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text("Нет сохранённых отчётов за последние 7 дней.")
         return
 
-    serv = sum((r["services_total"] or 0) for r in rows)
-    drink = sum((r["drinks_total"] or 0) for r in rows)
+    serv = sum((r.get("services_total") or 0) for r in rows)
+    drink = sum((r.get("drinks_total") or 0) for r in rows)
     total = serv + drink
 
     wd, pc, rf, sal, by_staff = period_ops_and_salary(rows)
@@ -877,8 +825,8 @@ async def cmd_day(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text("Нет отчётов за этот день.")
         return
 
-    serv = sum((r["services_total"] or 0) for r in rows)
-    drink = sum((r["drinks_total"] or 0) for r in rows)
+    serv = sum((r.get("services_total") or 0) for r in rows)
+    drink = sum((r.get("drinks_total") or 0) for r in rows)
     total = serv + drink
     shifts = len(rows)
 
@@ -927,8 +875,8 @@ async def cmd_month(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text("Нет отчётов за этот месяц.")
         return
 
-    serv = sum((r["services_total"] or 0) for r in rows)
-    drink = sum((r["drinks_total"] or 0) for r in rows)
+    serv = sum((r.get("services_total") or 0) for r in rows)
+    drink = sum((r.get("drinks_total") or 0) for r in rows)
     total = serv + drink
     shifts = len(rows)
 
@@ -973,12 +921,12 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.effective_chat.id
     branch = branch_from_chat(chat_id)
     if not branch:
-        return  # игнор чужих чатов
+        return
 
     text = update.message.text.strip()
     blocks = split_into_blocks(text)
     if not blocks:
-        return  # не похоже на отчет
+        return
 
     parsed_reports: List[ParsedReport] = []
     for b in blocks:
@@ -1022,7 +970,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 # =========================
-# WEEKLY JOB (каждый понедельник 11:00)
+# WEEKLY JOB
 # =========================
 
 async def weekly_digest_job(context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1050,10 +998,8 @@ def main() -> None:
         .build()
     )
 
-    # timezone для job_queue (чтобы понедельник 11:00 был по Asia/Almaty)
     app.job_queue.scheduler.timezone = TZ
 
-    # commands
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("whoami", cmd_whoami))
     app.add_handler(CommandHandler("week", cmd_week))
@@ -1061,10 +1007,8 @@ def main() -> None:
     app.add_handler(CommandHandler("month", cmd_month))
     app.add_handler(CommandHandler("digest_week", cmd_digest_week))
 
-    # text reports
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
 
-    # weekly digest schedule
     if ENABLE_WEEKLY_DIGEST:
         hh, mm = WEEKLY_DIGEST_TIME.split(":")
         app.job_queue.run_daily(
@@ -1074,7 +1018,7 @@ def main() -> None:
             name="weekly_digest",
         )
 
-    print("🤖 Bot started")
+    print("🤖 Bot started (PostgreSQL)")
     app.run_polling(drop_pending_updates=True)
 
 
